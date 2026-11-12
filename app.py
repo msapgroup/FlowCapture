@@ -256,26 +256,32 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         try:
             if path=='/api/invitation/accept':
-                body=self.json();token=str(body.get('token','')); digest=hashlib.sha256(token.encode()).hexdigest()
+                body=self.json();token=str(body.get('token',''));password=body.get('password','');digest=hashlib.sha256(token.encode()).hexdigest()
+                if not isinstance(password,str) or not 12<=len(password)<=1024:raise ValueError('Password must be at least 12 characters.')
                 with LOCK, db() as c:
-                    row=c.execute('SELECT invitations.user_id,users.active FROM invitations JOIN users ON users.id=invitations.user_id WHERE token_hash=? AND used=0 AND expires>?',(digest,now())).fetchone()
+                    row=c.execute('SELECT invitations.user_id,users.active,users.username FROM invitations JOIN users ON users.id=invitations.user_id WHERE token_hash=? AND used=0 AND expires>?',(digest,now())).fetchone()
                     if not row or not row['active']: self.response(400,{'error':'Invitation is invalid, expired, or already used.'});return
                     changed=c.execute('UPDATE invitations SET used=1 WHERE token_hash=? AND used=0',(digest,)).rowcount
                     if changed!=1: self.response(400,{'error':'Invitation already used.'});return
-                    session=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=30)).isoformat()
+                    c.execute('UPDATE users SET password=? WHERE id=?',(pw_hash(password),row['user_id']))
+                    c.execute('DELETE FROM sessions WHERE user_id=?',(row['user_id'],))
+                    c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(row['user_id'],))
+                    session=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=7)).isoformat()
                     c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(session.encode()).hexdigest(),row['user_id'],csrf,expiry));c.commit()
                     secure='; Secure' if os.environ.get('FLOWCAPTURE_SECURE_COOKIES')=='1' else ''
-                    self.response(200,{'ok':True},extra={'Set-Cookie':f'fc_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}'})
+                    self.response(200,{'ok':True,'username':row['username']},extra={'Set-Cookie':f'fc_session={session}; HttpOnly; SameSite=Strict; Path=/{secure}'})
                 return
             if path=='/api/login':
-                body=self.json(); user=str(body.get('username','')).strip(); password=str(body.get('password',''))
+                body=self.json(); user=str(body.get('username','')).strip(); password=str(body.get('password',''));remember=body.get('remember',False)
+                if not isinstance(remember,bool):raise ValueError('Invalid login preference.')
                 with db() as c:
                     row=c.execute('SELECT * FROM users WHERE username=? AND active=1',(user,)).fetchone()
                     if not row or not verify(password,row['password']): self.response(401,{'error':'Invalid username or password.'}); return
-                    token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32); expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=7)).isoformat()
+                    token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32); expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=30 if remember else 7)).isoformat()
                     c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row['id'],csrf,expiry));c.commit()
                     secure='; Secure' if os.environ.get('FLOWCAPTURE_SECURE_COOKIES')=='1' else ''
-                    self.response(200,{'ok':True},extra={'Set-Cookie':f'fc_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{secure}'})
+                    persistent='; Max-Age=2592000' if remember else ''
+                    self.response(200,{'ok':True},extra={'Set-Cookie':f'fc_session={token}; HttpOnly; SameSite=Strict; Path=/{persistent}{secure}'})
                 return
             with db() as c:
                 u=self.authorized(c,True)
@@ -300,7 +306,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/users':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'}); return
                     b=self.json(); username=str(b.get('username','')).strip(); password=str(b.get('password','')); role=b.get('role')
-                    if not 3<=len(username)<=80 or len(password)<12 or role not in ('admin','office','front'): raise ValueError('Use a username of 3–80 characters and a password of at least 12 characters.')
+                    if not 3<=len(username)<=80 or (password and not 12<=len(password)<=1024) or role not in ('admin','office','front'): raise ValueError('Use a username of 3–80 characters and a password of at least 12 characters.')
+                    if not password:password=secrets.token_urlsafe(32)
                     c.execute('INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)',(str(uuid.uuid4()),username,pw_hash(password),role)); c.commit(); self.response(201,{'ok':True}); return
                 if path=='/api/messages':
                     if u['role'] not in ('admin','office'): self.response(403,{'error':'Office access required.'});return
@@ -314,10 +321,10 @@ class Handler(BaseHTTPRequestHandler):
                     c.commit();self.response(200,{'ok':True});return
                 if path=='/api/invitations':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
-                    b=self.json();user=c.execute("SELECT id FROM users WHERE id=? AND role='front' AND active=1",(str(b.get('user_id','')),)).fetchone()
-                    if not user: self.response(400,{'error':'Select an active Front Line Staff user.'});return
+                    b=self.json();user=c.execute("SELECT id FROM users WHERE id=? AND active=1",(str(b.get('user_id','')),)).fetchone()
+                    if not user: self.response(400,{'error':'Select an active user.'});return
                     token=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=24)).isoformat()
-                    c.execute('INSERT INTO invitations VALUES(?,?,?,0)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],expiry));c.commit();self.response(201,{'token':token,'expires':expiry});return
+                    c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(user['id'],));c.execute('INSERT INTO invitations VALUES(?,?,?,0)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],expiry));c.commit();self.response(201,{'token':token,'expires':expiry});return
                 if path=='/api/devices/revoke':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
                     b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));c.commit();self.response(200,{'ok':True});return
