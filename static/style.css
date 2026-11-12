@@ -4,3 +4,5 @@
 #template-shared,.field-required{display:inline-block;width:20px;min-height:0;height:20px;vertical-align:middle;margin:0 8px 0 0}.template-field{padding:8px 0;border-top:1px solid var(--line)}.template-entry{border-top:1px solid var(--line);padding:12px 0}.template-entry button{margin-top:8px}
 
 #upload-preview{display:block;max-height:320px;max-width:100%;object-fit:contain;border-radius:10px;margin:12px auto}
+
+.password-toggle{display:flex;align-items:center;gap:8px}.password-toggle input{display:inline-block;width:20px;height:20px;min-height:0;margin:0}
