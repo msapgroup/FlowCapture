@@ -117,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows=c.execute('SELECT * FROM templates WHERE shared=1 OR owner=? ORDER BY created DESC',(u['id'],)).fetchall();self.response(200,{'templates':[template_record(r) for r in rows]});return
             if path=='/api/tickets':
                 rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall())) for r in rows]}); return
-            if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role FROM users WHERE active=1 ORDER BY username')]}); return
+            if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role,active FROM users ORDER BY username')]}); return
             parts=path.strip('/').split('/')
             if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='file':
                 row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
@@ -147,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
                     row=c.execute('SELECT * FROM users WHERE username=? AND active=1',(user,)).fetchone()
                     if not row or not verify(password,row['password']): self.response(401,{'error':'Invalid username or password.'}); return
                     token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32); expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=7)).isoformat()
-                    c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row['id'],csrf,expiry))
+                    c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row['id'],csrf,expiry));c.commit()
                     secure='; Secure' if os.environ.get('FLOWCAPTURE_SECURE_COOKIES')=='1' else ''
                     self.response(200,{'ok':True},extra={'Set-Cookie':f'fc_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{secure}'})
                 return
@@ -155,43 +155,79 @@ class Handler(BaseHTTPRequestHandler):
                 u=self.authorized(c,True)
                 if not u: return
                 if path=='/api/logout':
-                    jar=cookies.SimpleCookie(); jar.load(self.headers.get('Cookie','')); c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(jar['fc_session'].value.encode()).hexdigest(),)); self.response(200,{'ok':True},extra={'Set-Cookie':'fc_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'}); return
+                    jar=cookies.SimpleCookie(); jar.load(self.headers.get('Cookie','')); c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(jar['fc_session'].value.encode()).hexdigest(),)); c.commit(); self.response(200,{'ok':True},extra={'Set-Cookie':'fc_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'}); return
+                if path=='/api/users/access':
+                    if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
+                    b=self.json();target=str(b.get('user_id',''));active=b.get('active')
+                    if not isinstance(active,bool) or target==u['id']:raise ValueError('Invalid user access change')
+                    if not c.execute('SELECT 1 FROM users WHERE id=?',(target,)).fetchone():self.response(404,{'error':'User not found.'});return
+                    c.execute('UPDATE users SET active=? WHERE id=?',(int(active),target))
+                    if not active:
+                        c.execute('DELETE FROM sessions WHERE user_id=?',(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,))
+                    c.commit();self.response(200,{'ok':True});return
+                if path=='/api/password':
+                    b=self.json();current=str(b.get('current',''));password=str(b.get('password',''));row=c.execute('SELECT password FROM users WHERE id=?',(u['id'],)).fetchone()
+                    if not verify(current,row['password']):self.response(400,{'error':'Current password is incorrect.'});return
+                    if len(password)<12 or len(password)>1024:raise ValueError('Invalid password')
+                    jar=cookies.SimpleCookie();jar.load(self.headers.get('Cookie',''));current_hash=hashlib.sha256(jar['fc_session'].value.encode()).hexdigest()
+                    c.execute('UPDATE users SET password=? WHERE id=?',(pw_hash(password),u['id']));c.execute('DELETE FROM sessions WHERE user_id=? AND token_hash<>?',(u['id'],current_hash));c.commit();self.response(200,{'ok':True});return
                 if path=='/api/users':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'}); return
                     b=self.json(); username=str(b.get('username','')).strip(); password=str(b.get('password','')); role=b.get('role')
                     if not 3<=len(username)<=80 or len(password)<12 or role not in ('admin','office','front'): raise ValueError('Use a username of 3–80 characters and a password of at least 12 characters.')
-                    c.execute('INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)',(str(uuid.uuid4()),username,pw_hash(password),role)); self.response(201,{'ok':True}); return
+                    c.execute('INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)',(str(uuid.uuid4()),username,pw_hash(password),role)); c.commit(); self.response(201,{'ok':True}); return
                 if path=='/api/messages':
                     if u['role'] not in ('admin','office'): self.response(403,{'error':'Office access required.'});return
                     b=self.json();target=str(b.get('recipient',''));subject=str(b.get('subject','')).strip();body=str(b.get('body','')).strip()
                     if not subject or len(subject)>120 or not body or len(body)>2000 or not c.execute("SELECT 1 FROM users WHERE id=? AND role='front' AND active=1",(target,)).fetchone():raise ValueError('Check the message and staff member.')
-                    c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),target,u['id'],subject,body,'Sent',now()));self.response(201,{'ok':True});return
+                    c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),target,u['id'],subject,body,'Sent',now()));c.commit();self.response(201,{'ok':True});return
                 if path=='/api/messages/acknowledge':
                     b=self.json();result=c.execute("UPDATE messages SET status='Acknowledged' WHERE id=? AND recipient=?",(str(b.get('id','')),u['id'])).rowcount
                     if not result:self.response(404,{'error':'Message not found.'});return
-                    self.response(200,{'ok':True});return
+                    c.commit();self.response(200,{'ok':True});return
                 if path=='/api/invitations':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
                     b=self.json();user=c.execute("SELECT id FROM users WHERE id=? AND role='front' AND active=1",(str(b.get('user_id','')),)).fetchone()
                     if not user: self.response(400,{'error':'Select an active Front Line Staff user.'});return
                     token=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=24)).isoformat()
-                    c.execute('INSERT INTO invitations VALUES(?,?,?,0)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],expiry));self.response(201,{'token':token,'expires':expiry});return
+                    c.execute('INSERT INTO invitations VALUES(?,?,?,0)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],expiry));c.commit();self.response(201,{'token':token,'expires':expiry});return
                 if path=='/api/devices/revoke':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
-                    b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));self.response(200,{'ok':True});return
+                    b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));c.commit();self.response(200,{'ok':True});return
                 if path=='/api/templates':
                     b=self.json();payload=validate_template(b);shared=b.get('shared') is True
                     if shared and u['role']!='admin': self.response(403,{'error':'Only an Admin can share a template.'}); return
-                    tid=str(uuid.uuid4());c.execute('INSERT INTO templates VALUES(?,?,?,?,?,?,?,?)',(tid,payload['name'],payload['industry'],payload['doc_type'],json.dumps(payload['fields']),u['id'],int(shared),now()));self.response(201,{'id':tid});return
+                    tid=str(uuid.uuid4());c.execute('INSERT INTO templates VALUES(?,?,?,?,?,?,?,?)',(tid,payload['name'],payload['industry'],payload['doc_type'],json.dumps(payload['fields']),u['id'],int(shared),now()));c.commit();self.response(201,{'id':tid});return
                 if path=='/api/tickets': self.upload(c,u); return
                 parts=path.strip('/').split('/')
+                if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='edit':
+                    if u['role'] not in ('admin','office'): self.response(403,{'error':'Office or Admin access required.'});return
+                    b=self.json();row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
+                    if not row: self.response(404,{'error':'Not found.'});return
+                    keys=['number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes']
+                    values={}
+                    for k in keys:
+                        value=b.get(k,'')
+                        if not isinstance(value,str) or len(value)>2000: raise ValueError('Invalid ticket value')
+                        values[k]=value.strip()
+                    if any(not values[k] for k in ('number','vendor','date','customer','quantity')): raise ValueError('Missing ticket details')
+                    datetime.date.fromisoformat(values['date'])
+                    if any(safe_amount(values[k]) is None for k in ('quantity',)) or any(values[k] and safe_amount(values[k]) is None for k in ('gross','tare','net')):raise ValueError('Invalid quantity or weight')
+                    if str(b.get('updated',''))!=row['updated']:self.response(409,{'error':'This ticket changed. Reload it before editing.'});return
+                    other=c.execute('SELECT 1 FROM tickets WHERE number=? COLLATE NOCASE AND vendor=? COLLATE NOCASE AND date=? AND id<>?',(values['number'],values['vendor'],values['date'],row['id'])).fetchone()
+                    if other:self.response(409,{'error':'A ticket with that number, vendor and date already exists.'});return
+                    changed=c.execute('UPDATE tickets SET '+','.join(k+'=?' for k in keys)+',status=?,updated=? WHERE id=? AND updated=?',([values[k] for k in keys]+['Needs Review',now(),row['id'],row['updated']])).rowcount
+                    if not changed:self.response(409,{'error':'This ticket changed. Reload it before editing.'});return
+                    c.commit();self.response(200,{'ok':True});return
                 if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='review':
                     if u['role'] not in ('admin','office'): self.response(403,{'error':'Office or Admin access required.'}); return
                     b=self.json(); row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
                     if not row: self.response(404,{'error':'Not found.'}); return
                     rate=safe_amount(b.get('rate','')); qty=safe_amount(b.get('quantity',row['quantity']))
                     if rate is None or qty is None: raise ValueError('Enter a valid non-negative quantity and rate.')
-                    c.execute('UPDATE tickets SET rate=?,quantity=?,status=?,updated=? WHERE id=?',(str(rate),str(qty),'Ready',now(),row['id'])); self.response(200,{'ok':True}); return
+                    changed=c.execute('UPDATE tickets SET rate=?,quantity=?,status=?,updated=? WHERE id=? AND updated=?',(str(rate),str(qty),'Ready',now(),row['id'],str(b.get('updated','')))).rowcount
+                    if not changed:self.response(409,{'error':'This ticket changed. Reload it before approval.'});return
+                    c.commit(); self.response(200,{'ok':True}); return
                 self.response(404,{'error':'Not found.'})
         except sqlite3.IntegrityError: self.response(409,{'error':'That ticket (number, vendor, and date) or username already exists.'})
         except (ValueError,KeyError,json.JSONDecodeError): self.response(400,{'error':'Check the form and try again.'})
@@ -208,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
             elif name: fields[name]=(payload or b'').decode('utf-8')[:2000].strip()
         keys=['number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes']
         if any(not fields.get(k) for k in ['number','vendor','date','customer','quantity']) or not file or not file[1]: raise ValueError('Missing fields')
-        if safe_amount(fields['quantity']) is None: raise ValueError('Invalid quantity')
+        if safe_amount(fields['quantity']) is None or any(fields.get(k) and safe_amount(fields[k]) is None for k in ('gross','tare','net')): raise ValueError('Invalid quantity or weight')
         datetime.date.fromisoformat(fields['date'])
         raw=file[1]
         if raw.startswith(b'%PDF-'): typ='application/pdf'
@@ -227,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
                 extra[field['label']]=value
         tid=str(uuid.uuid4()); filename=Path(file[0]).name[:160]; stamp=now(); out=FILES/tid
         with LOCK:
-            if c.execute('SELECT 1 FROM tickets WHERE number=? AND vendor=? COLLATE NOCASE AND date=?',(fields['number'],fields['vendor'],fields['date'])).fetchone(): self.response(409,{'error':'A ticket with that number, vendor and date already exists.'}); return
+            if c.execute('SELECT 1 FROM tickets WHERE number=? COLLATE NOCASE AND vendor=? COLLATE NOCASE AND date=?',(fields['number'],fields['vendor'],fields['date'])).fetchone(): self.response(409,{'error':'A ticket with that number, vendor and date already exists.'}); return
             out.write_bytes(raw)
             try:
                 c.execute('INSERT INTO tickets(id,number,vendor,date,customer,job,truck,carrier,material,gross,tare,net,quantity,notes,status,filename,filetype,storage,owner,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tid,*[fields.get(k,'') for k in keys],'Needs Review',filename,typ,tid,u['id'],stamp,stamp)); c.executemany('INSERT INTO ticket_values VALUES(?,?,?)',[(tid,k,v) for k,v in extra.items()]); c.commit()

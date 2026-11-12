@@ -9,25 +9,26 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 - Sign in as Front Line Staff, Office Manager, or Admin.
 - Capture a JPEG, PNG, or PDF and manually enter ticket details.
 - Store the original privately and send the ticket to a shared office inbox.
-- Show the submitting user only their own tickets; allow office users to review all tickets and approve a quantity and rate to **Ready**.
+- Show the submitting user only their own tickets; allow office users to review all tickets and correct ticket details, then approve a quantity and rate to **Ready**.
 - Detect duplicate ticket number, vendor, and date; show client-side weight and US-ton checks.
-- Search ticket history, download the original, choose light or dark theme, and create users as an Admin.
+- Search ticket history, preview a selected image before submission, download the original, choose light or dark theme, and create users as an Admin.
 - Admins create and share industry templates with additional text, number, and date fields; users can export and privately import template files.
 - Admins generate single-use, 24-hour invitation links for staff devices and can disconnect all of a staff member’s sessions.
-- Office users send in-app messages to staff, who can acknowledge them. Messages appear when the app is opened or refreshed; no push alerts are sent yet.
+- Office users send in-app messages to staff, who can acknowledge them. Messages appear when the app is open or refreshed; the home screen checks for updates about every 30 seconds while visible. No push alerts are sent yet.
 
-**This is an early pilot, not production-ready.** It does not yet include AI/OCR, Gmail, QuickBooks, password reset, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. The office does not receive an email or push notification. A ticket is delivered when the server confirms its receipt; users must reopen or refresh their inbox to see new records. Accounting transactions are not created.
+**This is an early pilot, not production-ready.** It does not yet include AI/OCR, Gmail, QuickBooks, forgotten-password recovery, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. The office does not receive an email or push notification. A ticket is delivered when the server confirms its receipt; the visible home screen checks for new records about every 30 seconds; users can also reopen the inbox. Accounting transactions are not created.
 
 ## How to use the pilot
 
 1. **Admin setup:** Sign in and open **Team access**. Create a Front Line Staff account and an Office Manager account. Use a unique temporary password for each user and share it through a secure channel.
 2. **Capture a ticket:** Sign in as Front Line Staff, tap **Capture**, choose a JPEG, PNG, or PDF, and enter the ticket number, vendor, date, customer, and quantity. Complete the remaining fields as needed, then tap **Send to Office**. The success message appears after the server saves the record.
-3. **Review in the office:** Sign in as an Office Manager or Admin. Open **Office inbox**, select a record, and download its original attachment if needed. Enter quantity and rate, then choose **Approve to Ready**. The app shows a calculated subtotal; QuickBooks sending is not implemented yet.
+3. **Review in the office:** Sign in as an Office Manager or Admin. Open **Office inbox**, select a record, and download its original attachment if needed. Use **Edit ticket details** to correct a record, then enter quantity and rate and choose **Approve to Ready**. Saving edits returns the ticket to Needs Review; conflicting changes are rejected so a newer edit is not silently overwritten. The app shows a calculated subtotal; QuickBooks sending is not implemented yet.
 4. **Find a ticket:** Open **File history** and search by ticket number, customer, vendor, truck, PO, material, or date. Front Line Staff can see their own submissions; Office Managers and Admins can see the shared inbox.
 5. **Templates:** Open **Manage templates**. An Admin can create a shared template and add text, number, or date fields. Staff can import a JSON file for their own account. Select a template on the capture form; its additional fields will appear on each ticket. The standard hauling fields remain required in this pilot.
 6. **Invite a staff phone:** In **Team access**, create a Front Line Staff user, choose **Create invite link**, and send it privately to that person. The link is valid once for 24 hours. To invalidate outstanding invitations and sessions, choose **Disconnect all devices**. Invitation links contain a credential: share them privately and never post them publicly.
 7. **Messages:** Open **Messages & tasks**. An Office Manager or Admin can send a message to a staff user; staff can acknowledge it after opening the app. This pilot does not provide phone push notifications or email notifications.
-8. **Change appearance:** Tap **Theme** to switch between light and dark on that browser.
+8. **Account and access:** Use **Account** to change your password. Admins can disable and re-enable users from Team access; disabling a user invalidates sessions and invitations.
+9. **Change appearance:** Tap **Theme** to switch between light and dark on that browser.
 
 ## Run locally
 
@@ -44,6 +45,8 @@ The initial Admin environment settings are used only when the database is empty.
 Build with `docker build -t flowcapture .`. Run with a writable persistent volume mounted at `/data`, and supply the two Admin environment variables using your hosting provider's secret settings. The process runs as UID 10001; ensure it can write to the mounted directory. `FLOWCAPTURE_SECURE_COOKIES=1` requires HTTPS, so use TLS at a trusted reverse proxy. The application listens on port 8000.
 
 The pilot uses SQLite and local file storage. **Do not deploy it to a platform with ephemeral disk storage**, including a default stateless App Platform container: records and documents would be lost on redeploy. This pilot has not been hardened or validated for internet-facing production, and requires a protected network. Managed PostgreSQL/object storage, encrypted backups, authentication hardening, production deployment, and recovery testing are future work.
+
+For the planned customer-hosted setup and Microsoft Teams access, see [Hosting and Teams](docs/hosting-and-teams.md).
 
 ## Tests
 
