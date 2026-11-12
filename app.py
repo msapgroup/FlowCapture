@@ -30,6 +30,10 @@ def init():
     FILES.mkdir(parents=True, exist_ok=True)
     with db() as c:
         c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE COLLATE NOCASE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','office','front')), active INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS templates(id TEXT PRIMARY KEY, name TEXT NOT NULL, industry TEXT NOT NULL, doc_type TEXT NOT NULL, fields TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), shared INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ticket_values(ticket_id TEXT NOT NULL REFERENCES tickets(id), field_name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ticket_id,field_name));
+        CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, recipient TEXT NOT NULL REFERENCES users(id), sender TEXT NOT NULL REFERENCES users(id), subject TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS invitations(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), csrf TEXT NOT NULL, expires TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, number TEXT NOT NULL, vendor TEXT NOT NULL, date TEXT NOT NULL, customer TEXT NOT NULL, job TEXT NOT NULL, truck TEXT NOT NULL, carrier TEXT NOT NULL, material TEXT NOT NULL, gross TEXT NOT NULL, tare TEXT NOT NULL, net TEXT NOT NULL, quantity TEXT NOT NULL, notes TEXT NOT NULL, rate TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, filename TEXT NOT NULL, filetype TEXT NOT NULL, storage TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, UNIQUE(number,vendor,date));''')
         name=os.environ.get('FLOWCAPTURE_ADMIN_USER','').strip(); password=os.environ.get('FLOWCAPTURE_ADMIN_PASSWORD','')
@@ -44,6 +48,29 @@ def safe_amount(v):
     try:
         x=Decimal(str(v)); return x if x.is_finite() and x >= 0 else None
     except (InvalidOperation, ValueError): return None
+
+def template_record(row):
+    return {'id':row['id'],'name':row['name'],'industry':row['industry'],'doc_type':row['doc_type'],'fields':json.loads(row['fields']),'shared':bool(row['shared'])}
+
+def validate_template(body):
+    import re
+    if not isinstance(body,dict) or body.get('version',1)!=1: raise ValueError('Unsupported template')
+    result={}
+    for key in ('name','industry','doc_type'):
+        value=body.get(key)
+        if not isinstance(value,str) or not value.strip() or len(value)>120: raise ValueError('Invalid template details')
+        result[key]=value.strip()
+    fields=body.get('fields')
+    if not isinstance(fields,list) or len(fields)>30: raise ValueError('Invalid fields')
+    clean=[];keys=set();labels=set()
+    for f in fields:
+        if not isinstance(f,dict): raise ValueError('Invalid field')
+        key=f.get('key'); label=f.get('label'); kind=f.get('type'); required=f.get('required')
+        if not isinstance(key,str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,39}',key) or key in keys: raise ValueError('Invalid field key')
+        if not isinstance(label,str) or not label.strip() or len(label)>80 or label.strip().lower() in labels: raise ValueError('Invalid field label')
+        if kind not in ('text','number','date') or not isinstance(required,bool): raise ValueError('Invalid field type')
+        keys.add(key);labels.add(label.strip().lower());clean.append({'key':key,'label':label.strip(),'type':kind,'required':required})
+    result['fields']=clean;return result
 
 class Handler(BaseHTTPRequestHandler):
     server_version='FlowCapture/0.1'
@@ -82,8 +109,14 @@ class Handler(BaseHTTPRequestHandler):
             u=self.authorized(c)
             if not u: return
             if path=='/api/me': self.response(200,{'id':u['id'],'username':u['username'],'role':u['role'],'csrf':u['csrf']}); return
+            if path=='/api/messages':
+                rows=c.execute('SELECT messages.*,users.username AS staff FROM messages JOIN users ON users.id=messages.recipient '+('WHERE recipient=? ' if u['role']=='front' else '')+'ORDER BY created DESC',(u['id'],) if u['role']=='front' else ()).fetchall();self.response(200,{'messages':[dict(r) for r in rows]});return
+            if path=='/api/staff' and u['role'] in ('admin','office'):
+                self.response(200,{'users':[dict(r) for r in c.execute("SELECT id,username FROM users WHERE role='front' AND active=1 ORDER BY username")]});return
+            if path=='/api/templates':
+                rows=c.execute('SELECT * FROM templates WHERE shared=1 OR owner=? ORDER BY created DESC',(u['id'],)).fetchall();self.response(200,{'templates':[template_record(r) for r in rows]});return
             if path=='/api/tickets':
-                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[record(r) for r in rows]}); return
+                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall())) for r in rows]}); return
             if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role FROM users WHERE active=1 ORDER BY username')]}); return
             parts=path.strip('/').split('/')
             if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='file':
@@ -96,6 +129,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path=urlparse(self.path).path
         try:
+            if path=='/api/invitation/accept':
+                body=self.json();token=str(body.get('token','')); digest=hashlib.sha256(token.encode()).hexdigest()
+                with LOCK, db() as c:
+                    row=c.execute('SELECT invitations.user_id,users.active FROM invitations JOIN users ON users.id=invitations.user_id WHERE token_hash=? AND used=0 AND expires>?',(digest,now())).fetchone()
+                    if not row or not row['active']: self.response(400,{'error':'Invitation is invalid, expired, or already used.'});return
+                    changed=c.execute('UPDATE invitations SET used=1 WHERE token_hash=? AND used=0',(digest,)).rowcount
+                    if changed!=1: self.response(400,{'error':'Invitation already used.'});return
+                    session=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=30)).isoformat()
+                    c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(session.encode()).hexdigest(),row['user_id'],csrf,expiry));c.commit()
+                    secure='; Secure' if os.environ.get('FLOWCAPTURE_SECURE_COOKIES')=='1' else ''
+                    self.response(200,{'ok':True},extra={'Set-Cookie':f'fc_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}'})
+                return
             if path=='/api/login':
                 body=self.json(); user=str(body.get('username','')).strip(); password=str(body.get('password',''))
                 with db() as c:
@@ -116,6 +161,28 @@ class Handler(BaseHTTPRequestHandler):
                     b=self.json(); username=str(b.get('username','')).strip(); password=str(b.get('password','')); role=b.get('role')
                     if not 3<=len(username)<=80 or len(password)<12 or role not in ('admin','office','front'): raise ValueError('Use a username of 3–80 characters and a password of at least 12 characters.')
                     c.execute('INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)',(str(uuid.uuid4()),username,pw_hash(password),role)); self.response(201,{'ok':True}); return
+                if path=='/api/messages':
+                    if u['role'] not in ('admin','office'): self.response(403,{'error':'Office access required.'});return
+                    b=self.json();target=str(b.get('recipient',''));subject=str(b.get('subject','')).strip();body=str(b.get('body','')).strip()
+                    if not subject or len(subject)>120 or not body or len(body)>2000 or not c.execute("SELECT 1 FROM users WHERE id=? AND role='front' AND active=1",(target,)).fetchone():raise ValueError('Check the message and staff member.')
+                    c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),target,u['id'],subject,body,'Sent',now()));self.response(201,{'ok':True});return
+                if path=='/api/messages/acknowledge':
+                    b=self.json();result=c.execute("UPDATE messages SET status='Acknowledged' WHERE id=? AND recipient=?",(str(b.get('id','')),u['id'])).rowcount
+                    if not result:self.response(404,{'error':'Message not found.'});return
+                    self.response(200,{'ok':True});return
+                if path=='/api/invitations':
+                    if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
+                    b=self.json();user=c.execute("SELECT id FROM users WHERE id=? AND role='front' AND active=1",(str(b.get('user_id','')),)).fetchone()
+                    if not user: self.response(400,{'error':'Select an active Front Line Staff user.'});return
+                    token=secrets.token_urlsafe(32);expiry=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=24)).isoformat()
+                    c.execute('INSERT INTO invitations VALUES(?,?,?,0)',(hashlib.sha256(token.encode()).hexdigest(),user['id'],expiry));self.response(201,{'token':token,'expires':expiry});return
+                if path=='/api/devices/revoke':
+                    if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
+                    b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));self.response(200,{'ok':True});return
+                if path=='/api/templates':
+                    b=self.json();payload=validate_template(b);shared=b.get('shared') is True
+                    if shared and u['role']!='admin': self.response(403,{'error':'Only an Admin can share a template.'}); return
+                    tid=str(uuid.uuid4());c.execute('INSERT INTO templates VALUES(?,?,?,?,?,?,?,?)',(tid,payload['name'],payload['industry'],payload['doc_type'],json.dumps(payload['fields']),u['id'],int(shared),now()));self.response(201,{'id':tid});return
                 if path=='/api/tickets': self.upload(c,u); return
                 parts=path.strip('/').split('/')
                 if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='review':
@@ -148,12 +215,22 @@ class Handler(BaseHTTPRequestHandler):
         elif raw.startswith(b'\xff\xd8\xff'): typ='image/jpeg'
         elif raw.startswith(b'\x89PNG\r\n\x1a\n'): typ='image/png'
         else: raise ValueError('Unsupported file')
+        template_id=fields.get('template_id',''); extra={}
+        if template_id:
+            template=c.execute('SELECT * FROM templates WHERE id=? AND (shared=1 OR owner=?)',(template_id,u['id'])).fetchone()
+            if not template: self.response(403,{'error':'Template unavailable.'});return
+            for field in json.loads(template['fields']):
+                value=fields.get('custom_'+field['key'],'')
+                if field['required'] and not value: raise ValueError('Required template field is missing')
+                if value and field['type']=='number' and safe_amount(value) is None: raise ValueError('Invalid template number')
+                if value and field['type']=='date': datetime.date.fromisoformat(value)
+                extra[field['label']]=value
         tid=str(uuid.uuid4()); filename=Path(file[0]).name[:160]; stamp=now(); out=FILES/tid
         with LOCK:
             if c.execute('SELECT 1 FROM tickets WHERE number=? AND vendor=? COLLATE NOCASE AND date=?',(fields['number'],fields['vendor'],fields['date'])).fetchone(): self.response(409,{'error':'A ticket with that number, vendor and date already exists.'}); return
             out.write_bytes(raw)
             try:
-                c.execute('INSERT INTO tickets(id,number,vendor,date,customer,job,truck,carrier,material,gross,tare,net,quantity,notes,status,filename,filetype,storage,owner,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tid,*[fields.get(k,'') for k in keys],'Needs Review',filename,typ,tid,u['id'],stamp,stamp)); c.commit()
+                c.execute('INSERT INTO tickets(id,number,vendor,date,customer,job,truck,carrier,material,gross,tare,net,quantity,notes,status,filename,filetype,storage,owner,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tid,*[fields.get(k,'') for k in keys],'Needs Review',filename,typ,tid,u['id'],stamp,stamp)); c.executemany('INSERT INTO ticket_values VALUES(?,?,?)',[(tid,k,v) for k,v in extra.items()]); c.commit()
             except Exception:
                 out.unlink(missing_ok=True); raise
         self.response(201,{'id':tid,'status':'Needs Review'})

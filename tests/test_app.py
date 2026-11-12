@@ -27,12 +27,32 @@ class Workflow(unittest.TestCase):
         for name,role in [('driver','front'),('office','office')]:
             status,_,_=self.req('POST','/api/users',{'username':name,'password':'testing-password-456','role':role},admin,acsrf);self.assertEqual(status,201)
         driver,dcsrf=self.login('driver','testing-password-456');office,ocsrf=self.login('office','testing-password-456')
-        parts={'number':'3631110','vendor':'Conrad','date':'2026-10-05','customer':'Preferred','quantity':'24.26'}; boundary='flowcapture-boundary';body=b''
+        template={'version':1,'name':'Hauling','industry':'Hauling','doc_type':'Ticket','shared':True,'fields':[{'key':'job_code','label':'Job code','type':'text','required':True}]}
+        status,_,_=self.req('POST','/api/templates',template,driver,dcsrf);self.assertEqual(status,403)
+        status,_,data=self.req('POST','/api/templates',template,admin,acsrf);self.assertEqual(status,201);template_id=json.loads(data)['id']
+        status,_,data=self.req('GET','/api/templates',token=driver);self.assertEqual(json.loads(data)['templates'][0]['id'],template_id)
+        private=dict(template,shared=False,name='Private')
+        status,_,data=self.req('POST','/api/templates',private,driver,dcsrf);self.assertEqual(status,201)
+        status,_,data=self.req('GET','/api/templates',token=office);self.assertEqual(len(json.loads(data)['templates']),1)
+        _,_,data=self.req('GET','/api/users',token=admin);driver_id=next(x['id'] for x in json.loads(data)['users'] if x['username']=='driver')
+        status,_,_=self.req('POST','/api/invitations',{'user_id':driver_id},office,ocsrf);self.assertEqual(status,403)
+        status,_,data=self.req('POST','/api/invitations',{'user_id':driver_id},admin,acsrf);self.assertEqual(status,201);invite=json.loads(data)['token']
+        status,h,_=self.req('POST','/api/invitation/accept',{'token':invite});self.assertEqual(status,200);linked=h['Set-Cookie'].split(';')[0]
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':invite});self.assertEqual(status,400)
+        status,_,_=self.req('POST','/api/devices/revoke',{'user_id':driver_id},admin,acsrf);self.assertEqual(status,200)
+        status,_,_=self.req('GET','/api/me',token=linked);self.assertEqual(status,401)
+        driver,dcsrf=self.login('driver','testing-password-456')
+        status,_,_=self.req('POST','/api/messages',{'recipient':driver_id,'subject':'Missing ticket','body':'Please send ticket 3631111.'},office,ocsrf);self.assertEqual(status,201)
+        status,_,data=self.req('GET','/api/messages',token=driver);messages=json.loads(data)['messages'];self.assertEqual(messages[0]['subject'],'Missing ticket')
+        status,_,_=self.req('POST','/api/messages/acknowledge',{'id':messages[0]['id']},driver,dcsrf);self.assertEqual(status,200)
+        status,_,data=self.req('GET','/api/messages',token=office);self.assertEqual(json.loads(data)['messages'][0]['status'],'Acknowledged')
+        status,_,_=self.req('POST','/api/messages',{'recipient':driver_id,'subject':'Test','body':'No'},driver,dcsrf);self.assertEqual(status,403)
+        parts={'template_id':template_id,'custom_job_code':'ABC-5','number':'3631110','vendor':'Conrad','date':'2026-10-05','customer':'Preferred','quantity':'24.26'}; boundary='flowcapture-boundary';body=b''
         for k,v in parts.items():body+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
         body+=f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="ticket.pdf"\r\nContent-Type: application/pdf\r\n\r\n'.encode()+b'%PDF-1.4\nexample\r\n'+f'--{boundary}--\r\n'.encode();ct='multipart/form-data; boundary='+boundary
         status,_,data=self.req('POST','/api/tickets',body,driver,dcsrf,ct);self.assertEqual(status,201);tid=json.loads(data)['id']
         status,_,_=self.req('POST','/api/tickets',body,driver,dcsrf,ct);self.assertEqual(status,409)
-        status,_,data=self.req('GET','/api/tickets',token=office);self.assertEqual(json.loads(data)['tickets'][0]['id'],tid)
+        status,_,data=self.req('GET','/api/tickets',token=office);self.assertEqual(json.loads(data)['tickets'][0]['id'],tid);self.assertEqual(json.loads(data)['tickets'][0]['extra_fields']['Job code'],'ABC-5')
         status,_,_=self.req('POST',f'/api/tickets/{tid}/review',{'quantity':'24.26','rate':'12.50'},driver,dcsrf);self.assertEqual(status,403)
         status,_,_=self.req('POST',f'/api/tickets/{tid}/review',{'quantity':'24.26','rate':'12.50'},office,ocsrf);self.assertEqual(status,200)
         status,_,data=self.req('GET','/api/tickets',token=admin);self.assertEqual(json.loads(data)['tickets'][0]['status'],'Ready')

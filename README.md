@@ -12,8 +12,11 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 - Show the submitting user only their own tickets; allow office users to review all tickets and approve a quantity and rate to **Ready**.
 - Detect duplicate ticket number, vendor, and date; show client-side weight and US-ton checks.
 - Search ticket history, download the original, choose light or dark theme, and create users as an Admin.
+- Admins create and share industry templates with additional text, number, and date fields; users can export and privately import template files.
+- Admins generate single-use, 24-hour invitation links for staff devices and can disconnect all of a staff member’s sessions.
+- Office users send in-app messages to staff, who can acknowledge them. Messages appear when the app is opened or refreshed; no push alerts are sent yet.
 
-**This is an early pilot, not production-ready.** It does not yet include AI/OCR, Gmail, QuickBooks, password reset, staff invitation links, push notifications, template management, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. The office does not receive an email or push notification. A ticket is delivered when the server confirms its receipt; users must reopen or refresh their inbox to see new records. Accounting transactions are not created.
+**This is an early pilot, not production-ready.** It does not yet include AI/OCR, Gmail, QuickBooks, password reset, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. The office does not receive an email or push notification. A ticket is delivered when the server confirms its receipt; users must reopen or refresh their inbox to see new records. Accounting transactions are not created.
 
 ## How to use the pilot
 
@@ -21,7 +24,10 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 2. **Capture a ticket:** Sign in as Front Line Staff, tap **Capture**, choose a JPEG, PNG, or PDF, and enter the ticket number, vendor, date, customer, and quantity. Complete the remaining fields as needed, then tap **Send to Office**. The success message appears after the server saves the record.
 3. **Review in the office:** Sign in as an Office Manager or Admin. Open **Office inbox**, select a record, and download its original attachment if needed. Enter quantity and rate, then choose **Approve to Ready**. The app shows a calculated subtotal; QuickBooks sending is not implemented yet.
 4. **Find a ticket:** Open **File history** and search by ticket number, customer, vendor, truck, PO, material, or date. Front Line Staff can see their own submissions; Office Managers and Admins can see the shared inbox.
-5. **Change appearance:** Tap **Theme** to switch between light and dark on that browser.
+5. **Templates:** Open **Manage templates**. An Admin can create a shared template and add text, number, or date fields. Staff can import a JSON file for their own account. Select a template on the capture form; its additional fields will appear on each ticket. The standard hauling fields remain required in this pilot.
+6. **Invite a staff phone:** In **Team access**, create a Front Line Staff user, choose **Create invite link**, and send it privately to that person. The link is valid once for 24 hours. To invalidate outstanding invitations and sessions, choose **Disconnect all devices**. Invitation links contain a credential: share them privately and never post them publicly.
+7. **Messages:** Open **Messages & tasks**. An Office Manager or Admin can send a message to a staff user; staff can acknowledge it after opening the app. This pilot does not provide phone push notifications or email notifications.
+8. **Change appearance:** Tap **Theme** to switch between light and dark on that browser.
 
 ## Run locally
 
