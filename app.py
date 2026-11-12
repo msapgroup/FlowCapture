@@ -6,7 +6,8 @@ from email.policy import default
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+import qbo_integration as qbo
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -36,6 +37,9 @@ def init():
         CREATE TABLE IF NOT EXISTS templates(id TEXT PRIMARY KEY, name TEXT NOT NULL, industry TEXT NOT NULL, doc_type TEXT NOT NULL, fields TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), shared INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ticket_values(ticket_id TEXT NOT NULL REFERENCES tickets(id), field_name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ticket_id,field_name));
         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, recipient TEXT NOT NULL REFERENCES users(id), sender TEXT NOT NULL REFERENCES users(id), subject TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS qbo_connection(id INTEGER PRIMARY KEY CHECK(id=1), realm TEXT NOT NULL, environment TEXT NOT NULL, token TEXT NOT NULL, expires TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS qbo_states(state_hash TEXT PRIMARY KEY, cookie_hash TEXT NOT NULL, session_hash TEXT NOT NULL, user_id TEXT NOT NULL REFERENCES users(id), expires TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS qbo_transfers(ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), request_id TEXT NOT NULL, state TEXT NOT NULL, invoice_id TEXT NOT NULL DEFAULT '', created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS company_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS email_delivery(ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), status TEXT NOT NULL, updated TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ticket_events(id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), actor TEXT NOT NULL REFERENCES users(id), event TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', snapshot TEXT NOT NULL, created TEXT NOT NULL);
@@ -154,6 +158,10 @@ def extract_document(raw,typ):
     if len(texts)!=1:raise ValueError('AI response missing.')
     values=json.loads(texts[0]);return {k:str(values.get(k,''))[:2000] for k in AI_FIELDS if isinstance(values.get(k,''),str)}
 
+def qbo_ready():
+    try:qbo.config();return True
+    except ValueError:return False
+
 class Handler(BaseHTTPRequestHandler):
     server_version='FlowCapture/0.1'
     def log_message(self, fmt, *args): pass
@@ -185,6 +193,21 @@ class Handler(BaseHTTPRequestHandler):
         return u
     def do_GET(self):
         path=urlparse(self.path).path
+        if path=='/api/qbo/callback':
+            try:
+                query=parse_qs(urlparse(self.path).query);state=query.get('state',[''])[0];code=query.get('code',[''])[0];realm=query.get('realmId',[''])[0]
+                jar=cookies.SimpleCookie();jar.load(self.headers.get('Cookie',''));proof=jar['fc_qbo'].value
+                digest=hashlib.sha256(state.encode()).hexdigest();cookie_hash=hashlib.sha256(proof.encode()).hexdigest()
+                with LOCK,db() as c:
+                    row=c.execute("SELECT q.* FROM qbo_states q JOIN sessions s ON s.token_hash=q.session_hash JOIN users u ON u.id=q.user_id WHERE q.state_hash=? AND q.cookie_hash=? AND q.expires>? AND s.expires>? AND u.active=1 AND u.role='admin' AND s.user_id=q.user_id",(digest,cookie_hash,now(),now())).fetchone()
+                    if not row:raise ValueError('Authorization expired.')
+                    c.execute('DELETE FROM qbo_states WHERE state_hash=?',(digest,));c.commit()
+                    if not code or len(code)>512:raise ValueError('Authorization declined.')
+                    token=qbo.token_request({'grant_type':'authorization_code','code':code,'redirect_uri':qbo.config()['redirect']});qbo.save_token(c,realm,token)
+                self.send_response(303);self.send_header('Location','/?qbo=connected');self.send_header('Cache-Control','no-store');self.send_header('Referrer-Policy','no-referrer');self.send_header('Set-Cookie','fc_qbo=; HttpOnly; SameSite=Lax; Path=/api/qbo/callback; Max-Age=0');self.end_headers()
+            except Exception:
+                self.send_response(303);self.send_header('Location','/?qbo=error');self.send_header('Cache-Control','no-store');self.send_header('Referrer-Policy','no-referrer');self.end_headers()
+            return
         if path in ('/','/app.js','/style.css','/flowcapture-logo.png'):
             f=ROOT/'static'/('index.html' if path=='/' else path[1:]); self.response(200,f.read_bytes(),mimetypes.guess_type(f.name)[0] or 'application/octet-stream'); return
         with db() as c:
@@ -198,7 +221,13 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/company-settings':
                 if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
                 values=dict(c.execute('SELECT key,value FROM company_settings').fetchall())
-                self.response(200,{'office_email':values.get('office_email',''),'email_configured':bool(os.environ.get('FLOWCAPTURE_GMAIL_ADDRESS') and os.environ.get('FLOWCAPTURE_GMAIL_APP_PASSWORD') and values.get('office_email')),'quickbooks_connected':False,'ai_enabled':values.get('ai_enabled')=='1','ai_configured':bool(os.environ.get('OPENAI_API_KEY') and os.environ.get('FLOWCAPTURE_AI_MODEL'))});return
+                self.response(200,{'office_email':values.get('office_email',''),'email_configured':bool(os.environ.get('FLOWCAPTURE_GMAIL_ADDRESS') and os.environ.get('FLOWCAPTURE_GMAIL_APP_PASSWORD') and values.get('office_email')),'quickbooks_connected':bool(qbo_ready() and c.execute('SELECT 1 FROM qbo_connection WHERE id=1 AND environment=?',(os.environ.get('FLOWCAPTURE_QBO_ENV','sandbox'),)).fetchone()),'quickbooks_configured':qbo_ready(),'ai_enabled':values.get('ai_enabled')=='1','ai_configured':bool(os.environ.get('OPENAI_API_KEY') and os.environ.get('FLOWCAPTURE_AI_MODEL'))});return
+            if path=='/api/qbo/options':
+                if u['role'] not in ('admin','office'):self.response(403,{'error':'Office access required.'});return
+                try:
+                    with LOCK:customers=qbo.list_active(c,'Customer');items=qbo.list_active(c,'Item')
+                    self.response(200,{'customers':customers,'items':items});return
+                except Exception:self.response(502,{'error':'Unable to load QuickBooks customers and items. Check the connection.'});return
             if path=='/api/templates':
                 rows=c.execute('SELECT * FROM templates WHERE shared=1 OR owner=? ORDER BY created DESC',(u['id'],)).fetchall();self.response(200,{'templates':[template_record(r) for r in rows]});return
             if path=='/api/ticket-events':
@@ -208,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                 query+=' ORDER BY e.created DESC'
                 self.response(200,{'events':[dict(r) for r in c.execute(query,args)]});return
             if path=='/api/tickets':
-                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r,u['role']), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall()),email_status=(c.execute('SELECT status FROM email_delivery WHERE ticket_id=?',(r['id'],)).fetchone() or ['Not configured'])[0]) for r in rows]}); return
+                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r,u['role']), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall()),email_status=(c.execute('SELECT status FROM email_delivery WHERE ticket_id=?',(r['id'],)).fetchone() or ['Not configured'])[0],qbo_invoice_id=(c.execute("SELECT invoice_id FROM qbo_transfers WHERE ticket_id=? AND state='sent'",(r['id'],)).fetchone() or [''])[0]) for r in rows]}); return
             if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role,active FROM users ORDER BY username')]}); return
             parts=path.strip('/').split('/')
             if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='summary.pdf':
@@ -292,6 +321,19 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/devices/revoke':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
                     b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));c.commit();self.response(200,{'ok':True});return
+                if path=='/api/qbo/connect':
+                    if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
+                    try:
+                        state=secrets.token_urlsafe(32);proof=secrets.token_urlsafe(32);url=qbo.authorization_url(state)
+                        jar=cookies.SimpleCookie();jar.load(self.headers.get('Cookie',''));session=jar['fc_session'].value
+                        expires=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=10)).isoformat()
+                        c.execute('INSERT INTO qbo_states VALUES(?,?,?,?,?)',(hashlib.sha256(state.encode()).hexdigest(),hashlib.sha256(proof.encode()).hexdigest(),hashlib.sha256(session.encode()).hexdigest(),u['id'],expires));c.commit()
+                        secure='; Secure' if os.environ.get('FLOWCAPTURE_SECURE_COOKIES')=='1' else ''
+                        self.response(200,{'url':url},extra={'Set-Cookie':f'fc_qbo={proof}; HttpOnly; SameSite=Lax; Path=/api/qbo/callback; Max-Age=600{secure}'});return
+                    except (ValueError,KeyError):self.response(400,{'error':'Configure QuickBooks hosting secrets and redirect URL first.'});return
+                if path=='/api/qbo/disconnect':
+                    if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
+                    c.execute('DELETE FROM qbo_connection WHERE id=1');c.commit();self.response(200,{'ok':True});return
                 if path=='/api/ai-extract':
                     enabled=c.execute("SELECT value FROM company_settings WHERE key='ai_enabled'").fetchone()
                     if not enabled or enabled['value']!='1' or not os.environ.get('OPENAI_API_KEY') or not os.environ.get('FLOWCAPTURE_AI_MODEL'):
@@ -324,6 +366,31 @@ class Handler(BaseHTTPRequestHandler):
                     tid=str(uuid.uuid4());c.execute('INSERT INTO templates VALUES(?,?,?,?,?,?,?,?)',(tid,payload['name'],payload['industry'],payload['doc_type'],json.dumps(payload['fields']),u['id'],int(shared),now()));c.commit();self.response(201,{'id':tid});return
                 if path=='/api/tickets': self.upload(c,u); return
                 parts=path.strip('/').split('/')
+                if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='qbo-send':
+                    if u['role'] not in ('admin','office'):self.response(403,{'error':'Office access required.'});return
+                    b=self.json();customer=str(b.get('customer_id',''));item=str(b.get('item_id',''));row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
+                    if not row:self.response(404,{'error':'Not found.'});return
+                    if row['status']!='Ready' or row['updated']!=str(b.get('updated','')):self.response(409,{'error':'Approve the latest ticket before sending.'});return
+                    try:
+                        with LOCK:
+                            customers=qbo.list_active(c,'Customer');items=qbo.list_active(c,'Item')
+                            if customer not in {x['id'] for x in customers} or item not in {x['id'] for x in items}:raise ValueError('Select an existing QuickBooks customer and item.')
+                            payload=qbo.invoice_payload(row,customer,item);request_id=str(uuid.uuid4())
+                            c.execute('BEGIN IMMEDIATE')
+                            claim=c.execute("UPDATE tickets SET status='Sending to QuickBooks',updated=? WHERE id=? AND status='Ready' AND updated=?",(now(),row['id'],row['updated'])).rowcount
+                            if not claim:c.rollback();self.response(409,{'error':'This ticket changed. Reload it before sending.'});return
+                            if not c.execute('INSERT OR IGNORE INTO qbo_transfers(ticket_id,request_id,state,created) VALUES(?,?,?,?)',(row['id'],request_id,'sending',now())).rowcount:
+                                c.rollback()
+                                self.response(409,{'error':'This ticket has already been sent or needs manual verification in QuickBooks.'});return
+                            c.commit()
+                            try:
+                                result=qbo.api(c,'POST','/invoice?requestid='+request_id,payload);invoice=result.get('Invoice',{});invoice_id=str(invoice.get('Id',''))
+                                if not invoice_id:raise ValueError('Missing invoice ID.')
+                                stamp=now();c.execute("UPDATE qbo_transfers SET state='sent',invoice_id=? WHERE ticket_id=?",(invoice_id,row['id']));c.execute("UPDATE tickets SET status='Sent to QuickBooks',updated=? WHERE id=?",(stamp,row['id']));c.commit()
+                            except Exception:
+                                c.execute("UPDATE qbo_transfers SET state='uncertain' WHERE ticket_id=?",(row['id'],));c.execute("UPDATE tickets SET status='Send result uncertain',updated=? WHERE id=?",(now(),row['id']));c.commit();self.response(502,{'error':'Result uncertain. Check QuickBooks for this invoice before attempting another send.'});return
+                        self.response(200,{'ok':True,'invoice_id':invoice_id});return
+                    except Exception:self.response(502,{'error':'Unable to verify QuickBooks customer and item. Check the connection.'});return
                 if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3] in ('reject','resubmit'):
                     b=self.json(); row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
                     if not row:self.response(404,{'error':'Not found.'});return
@@ -345,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                     if u['role'] not in ('admin','office'): self.response(403,{'error':'Office or Admin access required.'});return
                     b=self.json();row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
                     if not row: self.response(404,{'error':'Not found.'});return
-                    if row['status']=='Rejected':self.response(409,{'error':'The staff member must resend this rejected ticket first.'});return
+                    if row['status'] in ('Rejected','Sent to QuickBooks','Sending to QuickBooks','Send result uncertain'):self.response(409,{'error':'This ticket cannot be edited in its current status.'});return
                     keys=['number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes']
                     values={}
                     for k in keys:
