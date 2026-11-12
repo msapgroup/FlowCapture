@@ -30,6 +30,22 @@ class Workflow(unittest.TestCase):
         for name,role in [('driver','front'),('office','office')]:
             status,_,_=self.req('POST','/api/users',{'username':name,'password':'testing-password-456','role':role},admin,acsrf);self.assertEqual(status,201)
         driver,dcsrf=self.login('driver','testing-password-456');office,ocsrf=self.login('office','testing-password-456')
+        status,h,_=self.req('POST','/api/login',{'username':'driver','password':'testing-password-456','remember':False});self.assertEqual(status,200);self.assertNotIn('Max-Age',h['Set-Cookie'])
+        status,h,_=self.req('POST','/api/login',{'username':'driver','password':'testing-password-456','remember':True});self.assertEqual(status,200);self.assertIn('Max-Age=2592000',h['Set-Cookie']);self.assertNotIn('testing-password-456',h['Set-Cookie'])
+        status,_,_=self.req('POST','/api/users',{'username':'newhire','role':'front'},admin,acsrf);self.assertEqual(status,201)
+        status,_,data=self.req('GET','/api/users',token=admin);newid=next(x['id'] for x in json.loads(data)['users'] if x['username']=='newhire')
+        status,_,data=self.req('POST','/api/invitations',{'user_id':newid},admin,acsrf);self.assertEqual(status,201);newtoken=json.loads(data)['token']
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':newtoken,'password':'newhire-password-123'},None,None);self.assertEqual(status,200)
+        new_session,new_csrf=self.login('newhire','newhire-password-123')
+        status,_,_=self.req('POST','/api/invitations',{'user_id':newid},office,ocsrf);self.assertEqual(status,403)
+        status,_,data=self.req('POST','/api/invitations',{'user_id':newid},admin,acsrf);self.assertEqual(status,201);reset=json.loads(data)['token']
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':reset,'password':'replacement-password-987'});self.assertEqual(status,200)
+        status,_,_=self.req('GET','/api/me',token=new_session);self.assertEqual(status,401)
+        status,_,_=self.req('POST','/api/login',{'username':'newhire','password':'newhire-password-123'});self.assertEqual(status,401)
+        self.login('newhire','replacement-password-987')
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':reset,'password':'another-password-123'});self.assertEqual(status,400)
+
+
         status,_,_=self.req('GET','/api/company-settings',token=driver);self.assertEqual(status,403)
         status,_,_=self.req('POST','/api/company-settings',{'office_email':'office@example.com'},office,ocsrf);self.assertEqual(status,403)
         status,_,_=self.req('POST','/api/company-settings',{'office_email':'bad'},admin,acsrf);self.assertEqual(status,400)
@@ -45,8 +61,10 @@ class Workflow(unittest.TestCase):
         _,_,data=self.req('GET','/api/users',token=admin);driver_id=next(x['id'] for x in json.loads(data)['users'] if x['username']=='driver')
         status,_,_=self.req('POST','/api/invitations',{'user_id':driver_id},office,ocsrf);self.assertEqual(status,403)
         status,_,data=self.req('POST','/api/invitations',{'user_id':driver_id},admin,acsrf);self.assertEqual(status,201);invite=json.loads(data)['token']
-        status,h,_=self.req('POST','/api/invitation/accept',{'token':invite});self.assertEqual(status,200);linked=h['Set-Cookie'].split(';')[0]
-        status,_,_=self.req('POST','/api/invitation/accept',{'token':invite});self.assertEqual(status,400)
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':invite,'password':'short'},None,None);self.assertEqual(status,400)
+        status,h,data=self.req('POST','/api/invitation/accept',{'token':invite,'password':'testing-password-456'});self.assertEqual(status,200);self.assertEqual(json.loads(data)['username'],'driver');linked=h['Set-Cookie'].split(';')[0]
+        status,_,_=self.req('GET','/api/me',token=driver);self.assertEqual(status,401)
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':invite,'password':'testing-password-456'});self.assertEqual(status,400)
         status,_,_=self.req('POST','/api/devices/revoke',{'user_id':driver_id},admin,acsrf);self.assertEqual(status,200)
         status,_,_=self.req('GET','/api/me',token=linked);self.assertEqual(status,401)
         driver,dcsrf=self.login('driver','testing-password-456')
