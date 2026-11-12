@@ -1,6 +1,8 @@
 import http.client, json, os, tempfile, threading, unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from urllib.parse import urlparse, parse_qs
+from cryptography.fernet import Fernet
 from http.server import ThreadingHTTPServer
 import app
 
@@ -114,5 +116,36 @@ class Workflow(unittest.TestCase):
         status,_,_=self.req('POST','/api/users/access',{'user_id':driver_id,'active':False},admin,acsrf);self.assertEqual(status,200)
         status,_,_=self.req('GET','/api/me',token=driver);self.assertEqual(status,401)
         status,_,_=self.req('POST','/api/users/access',{'user_id':driver_id,'active':True},admin,acsrf);self.assertEqual(status,200)
-        self.login('driver','new-testing-password-789')
+        driver,dcsrf=self.login('driver','new-testing-password-789')
+        qenv={'FLOWCAPTURE_QBO_CLIENT_ID':'test-client','FLOWCAPTURE_QBO_CLIENT_SECRET':'test-secret','FLOWCAPTURE_QBO_REDIRECT_URI':'http://localhost:8000/api/qbo/callback','FLOWCAPTURE_QBO_ENCRYPTION_KEY':Fernet.generate_key().decode(),'FLOWCAPTURE_QBO_ENV':'sandbox'}
+        with patch.dict(os.environ,qenv), patch('qbo_integration.token_request',return_value={'access_token':'test-access','refresh_token':'test-refresh','expires_in':3600}):
+            status,_,_=self.req('POST','/api/qbo/connect',{},driver,dcsrf);self.assertEqual(status,403)
+            status,h,data=self.req('POST','/api/qbo/connect',{},admin,acsrf);self.assertEqual(status,200)
+            state=parse_qs(urlparse(json.loads(data)['url']).query)['state'][0];cookie=h['Set-Cookie'].split(';')[0]
+            status,_,_=self.req('GET','/api/qbo/callback?state='+state+'&code=testing&realmId=123',token=cookie);self.assertEqual(status,303)
+            with app.db() as c:self.assertNotIn('test-refresh',c.execute('SELECT token FROM qbo_connection').fetchone()[0])
+            status,_,data=self.req('GET','/api/company-settings',token=admin);self.assertTrue(json.loads(data)['quickbooks_connected'])
+            status,_,_=self.req('GET','/api/qbo/options',token=driver);self.assertEqual(status,403)
+            with patch('qbo_integration.list_active',side_effect=lambda c,e:[{'id':'1' if e=='Customer' else '2','name':e}]), patch('qbo_integration.api',return_value={'Invoice':{'Id':'42'}}) as invoice_api:
+                status,_,data=self.req('GET','/api/tickets',token=office);current=json.loads(data)['tickets'][0]
+                status,_,_=self.req('POST',f'/api/tickets/{tid}/review',{'quantity':'24.26','rate':'12.50','updated':current['updated']},office,ocsrf);self.assertEqual(status,200)
+                status,_,data=self.req('GET','/api/tickets',token=office);current=json.loads(data)['tickets'][0]
+                send={'customer_id':'1','item_id':'2','updated':current['updated']}
+                status,_,_=self.req('POST',f'/api/tickets/{tid}/qbo-send',send,driver,dcsrf);self.assertEqual(status,403)
+                status,_,data=self.req('POST',f'/api/tickets/{tid}/qbo-send',send,office,ocsrf);self.assertEqual(status,200);self.assertEqual(json.loads(data)['invoice_id'],'42')
+                payload=invoice_api.call_args.args[3];self.assertEqual(payload['CustomerRef']['value'],'1');self.assertEqual(payload['Line'][0]['Amount'],303.25);self.assertFalse(payload['AllowOnlineACHPayment'])
+                status,_,_=self.req('POST',f'/api/tickets/{tid}/qbo-send',send,office,ocsrf);self.assertEqual(status,409);self.assertEqual(invoice_api.call_count,1)
+                status,_,data=self.req('GET','/api/tickets',token=office);self.assertEqual(json.loads(data)['tickets'][0]['status'],'Sent to QuickBooks')
+            second=body.replace(b'3631110',b'3631120')
+            status,_,data=self.req('POST','/api/tickets',second,driver,dcsrf,ct);self.assertEqual(status,201);tid2=json.loads(data)['id']
+            status,_,data=self.req('GET','/api/tickets',token=office);second_ticket=next(t for t in json.loads(data)['tickets'] if t['id']==tid2)
+            status,_,_=self.req('POST',f'/api/tickets/{tid2}/review',{'quantity':'24.26','rate':'12.50','updated':second_ticket['updated']},office,ocsrf);self.assertEqual(status,200)
+            status,_,data=self.req('GET','/api/tickets',token=office);second_ticket=next(t for t in json.loads(data)['tickets'] if t['id']==tid2)
+            with patch('qbo_integration.list_active',side_effect=lambda c,e:[{'id':'1' if e=='Customer' else '2','name':e}]),patch('qbo_integration.api',side_effect=OSError('timeout')) as failed_api:
+                send={'customer_id':'1','item_id':'2','updated':second_ticket['updated']}
+                status,_,_=self.req('POST',f'/api/tickets/{tid2}/qbo-send',send,office,ocsrf);self.assertEqual(status,502)
+                status,_,data=self.req('GET','/api/tickets',token=office);current=next(t for t in json.loads(data)['tickets'] if t['id']==tid2);self.assertEqual(current['status'],'Send result uncertain')
+                send['updated']=current['updated'];status,_,_=self.req('POST',f'/api/tickets/{tid2}/qbo-send',send,office,ocsrf);self.assertEqual(status,409);self.assertEqual(failed_api.call_count,1)
+
+
 if __name__=='__main__':unittest.main()
