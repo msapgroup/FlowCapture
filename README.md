@@ -15,16 +15,16 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 - Admins create and share industry templates with additional text, number, and date fields; users can export and privately import template files.
 - Admins generate single-use, 24-hour invitation links for staff devices and can disconnect all of a staff member’s sessions.
 - Office users can reject a ticket with a reason; the submitting staff member receives an in-app notice and can provide a correction and resend it. A separate rejection history is retained after resubmission. Approval also creates an in-app notice.
-- Admins can configure an office email address and use Gmail SMTP with an app password supplied in hosting secrets. A new submission can email its original attachment and a PDF summary; email status is separate from the office inbox. QuickBooks Online connection is not implemented yet.
+- Admins can configure an office email address and use Gmail SMTP with an app password supplied in hosting secrets. A new submission can email its original attachment and a PDF summary; email status is separate from the office inbox. QuickBooks Online can be connected using customer-hosted Intuit app credentials.
 - Office users send in-app messages to staff, who can acknowledge and mark them completed. Messages appear when the app is open or refreshed; the home screen checks for updates about every 30 seconds while visible. No push alerts are sent yet.
 
-**This is an early pilot, not production-ready.** It does not yet include QuickBooks, forgotten-password recovery, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. Gmail delivery is optional; push notifications are not implemented. A ticket is delivered when the server confirms its receipt; the visible home screen checks for new records about every 30 seconds; users can also reopen the inbox. Accounting transactions are not created.
+**This is an early pilot, not production-ready.** It does not yet include forgotten-password recovery, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. Gmail delivery is optional; push notifications are not implemented. A ticket is delivered when the server confirms its receipt; the visible home screen checks for new records about every 30 seconds; users can also reopen the inbox. Office staff can create a single-line invoice in a connected QuickBooks company after matching an existing customer and item.
 
 ## How to use the pilot
 
 1. **Admin setup:** Sign in and open **Team access**. Create a Front Line Staff account and an Office Manager account. Use a unique temporary password for each user and share it through a secure channel.
 2. **Capture a ticket:** Sign in as Front Line Staff, tap **Capture**, choose a JPEG, PNG, or PDF, and enter the ticket number, vendor, date, customer, and quantity. Complete the remaining fields as needed, then tap **Send to Office**. The success message appears after the server saves the record.
-3. **Review in the office:** Sign in as an Office Manager or Admin. Open **Office inbox**, select a record, and download its original attachment if needed. Use **Edit ticket details** to correct a record, then enter quantity and rate and choose **Approve for QuickBooks**. Saving edits returns the ticket to Needs Review; conflicting changes are rejected so a newer edit is not silently overwritten. The app shows a calculated subtotal; QuickBooks sending is not implemented yet. Office users can reject a ticket with a reason; it leaves the inbox, and the staff member can add a correction and resend it. Rejection history remains available in File history.
+3. **Review in the office:** Sign in as an Office Manager or Admin. Open **Office inbox**, select a record, and download its original attachment if needed. Use **Edit ticket details** to correct a record, then enter quantity and rate and choose **Approve for QuickBooks**. Saving edits returns the ticket to Needs Review; conflicting changes are rejected so a newer edit is not silently overwritten. The app shows a calculated subtotal; after approval, office staff can select an existing QuickBooks customer and item and create an invoice. Office users can reject a ticket with a reason; it leaves the inbox, and the staff member can add a correction and resend it. Rejection history remains available in File history.
 4. **Find a ticket:** Open **File history** and search by ticket number, customer, vendor, truck, PO, material, or date. Front Line Staff can see their own submissions; Office Managers and Admins can see the shared inbox. Open a ticket and select **Download delivery summary (PDF)** to save a summary; attach the original file separately if needed. The PDF is for review or manual entry, not a QuickBooks import file. Staff summaries do not include rates.
 5. **Templates:** Open **Manage templates**. An Admin can create a shared template and add text, number, or date fields. Staff can import a JSON file for their own account. Select a template on the capture form; its additional fields will appear on each ticket. The standard hauling fields remain required in this pilot.
 6. **Invite a staff phone:** In **Team access**, create a Front Line Staff user, choose **Create invite link**, and send it privately to that person. The link is valid once for 24 hours. To invalidate outstanding invitations and sessions, choose **Disconnect all devices**. Invitation links contain a credential: share them privately and never post them publicly.
@@ -34,7 +34,7 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 
 ## Run locally
 
-Python 3.12 or newer is required. No Python packages are needed.
+Python 3.12 or newer is required. Install dependencies with `python -m pip install -r requirements.txt`.
 
 1. Set `FLOWCAPTURE_ADMIN_USER` and `FLOWCAPTURE_ADMIN_PASSWORD` to create the initial Admin (password minimum 12 characters).
 2. Run `python app.py`.
@@ -52,7 +52,19 @@ An Admin saves the destination address under **Accounting & email setup**. Confi
 
 For each new submission, the app saves the office inbox record first, then attempts to email the original file and delivery summary over Gmail SMTP. It reports `Sent`, `Failed`, or `Not configured` separately. `Sent` means Gmail accepted the message, not that the recipient read it. This pilot does not automatically retry failures, send an email on resubmission, process incoming mail, or verify Gmail connectivity before a submission. The office inbox remains the source of truth.
 
-QuickBooks Online still needs an OAuth connection, customer and item matching, invoice creation, and sandbox tests. Creating an invoice through the QuickBooks API creates a financial transaction; it must not be presented as a guaranteed draft. Some QuickBooks settings can also automatically email imported invoices.
+## QuickBooks Online setup
+
+The customer creates an Intuit developer app with the QuickBooks Online Accounting scope, then configures these values as hosting secrets before starting FlowCapture:
+
+- `FLOWCAPTURE_QBO_CLIENT_ID` and `FLOWCAPTURE_QBO_CLIENT_SECRET`: the Intuit app credentials.
+- `FLOWCAPTURE_QBO_REDIRECT_URI`: the registered callback, for example `https://your-company.example/api/qbo/callback`. The URL must be HTTPS except on localhost.
+- `FLOWCAPTURE_QBO_ENCRYPTION_KEY`: a persistent Fernet key, generated with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Store it securely and back it up separately; changing or losing it prevents decrypting the connection.
+- `FLOWCAPTURE_QBO_ENV`: `sandbox` (the default) or `production`. Use the matching Intuit credentials and company for that environment.
+
+An Admin opens **Accounting & email setup → Connect QuickBooks Online** and authorizes the company. An Office Manager or Admin approves a ticket, opens **Match and send to QuickBooks**, chooses an existing customer and item, and creates the invoice. Unknown customers and items are never created. This pilot supports one invoice line per ticket and loads up to 1,000 active customers and items. The QuickBooks invoice ID is shown in the record.
+
+Creating the invoice is a financial transaction, not a guaranteed draft. The app requests no automatic payment or email, but company settings can affect delivery; verify them in a sandbox. If a send result is uncertain, FlowCapture blocks another send and displays **Send result uncertain**; check QuickBooks manually before taking action. The pilot has no automated reconciliation or retry. Disconnect removes the local connection; revoke access in Intuit as well. Credentials, callback, and invoice creation have only been tested with simulated responses, not with a live Intuit sandbox. Do not use this integration for live accounting until the customer has verified it.
+
 
 ## Container pilot
 
