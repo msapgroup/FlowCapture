@@ -41,12 +41,16 @@ def init():
             if not name or len(password)<12: raise SystemExit('Set FLOWCAPTURE_ADMIN_USER and FLOWCAPTURE_ADMIN_PASSWORD (at least 12 characters) before first start.')
             c.execute('INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)',(str(uuid.uuid4()),name,pw_hash(password),'admin'))
 
-def record(row):
-    return {k:row[k] for k in ('id','number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes','rate','status','filename','owner','created','updated')}
+def record(row, role=None):
+    data = {k:row[k] for k in ('id','number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes','rate','status','filename','owner','created','updated')}
+    if role=='front': data.pop('rate', None)
+    return data
 def safe_amount(v):
     from decimal import Decimal, InvalidOperation
     try:
-        x=Decimal(str(v)); return x if x.is_finite() and x >= 0 else None
+        raw=str(v)
+        if len(raw)>40:return None
+        x=Decimal(raw); return x if x.is_finite() and 0 <= x <= Decimal('1000000000000') and x.as_tuple().exponent >= -6 else None
     except (InvalidOperation, ValueError): return None
 
 def template_record(row):
@@ -71,6 +75,38 @@ def validate_template(body):
         if kind not in ('text','number','date') or not isinstance(required,bool): raise ValueError('Invalid field type')
         keys.add(key);labels.add(label.strip().lower());clean.append({'key':key,'label':label.strip(),'type':kind,'required':required})
     result['fields']=clean;return result
+
+def summary_pdf(row, extras, include_pricing):
+    # Standard PDF with a built-in font; long fields are wrapped onto new pages.
+    import textwrap
+    from decimal import Decimal, ROUND_HALF_UP
+    lines=['FLOWCAPTURE - DELIVERY SUMMARY','', 'Ticket: '+row['number'], 'Date: '+row['date'], 'Vendor / plant: '+row['vendor'], 'Customer: '+row['customer'], 'Job / PO: '+row['job'], 'Truck: '+row['truck'], 'Carrier: '+row['carrier'], 'Material: '+row['material'], 'Gross weight (lb): '+row['gross'], 'Tare weight (lb): '+row['tare'], 'Net weight (lb): '+row['net'], 'Quantity (US tons): '+row['quantity']]
+    for k,v in extras: lines.append(k+': '+v)
+    lines.extend(['Notes: '+row['notes'],'Status: '+row['status']])
+    if include_pricing and row['status']=='Ready' and row['rate']:
+        total=(Decimal(row['quantity'])*Decimal(row['rate'])).quantize(Decimal('0.01'),rounding=ROUND_HALF_UP)
+        lines.extend(['Rate per ton: $'+row['rate'],'Subtotal before taxes or other charges: $'+str(total)])
+    lines.extend(['','Original document is available separately in FlowCapture.','This summary is not a QuickBooks import file.'])
+    wrapped=[]
+    for line in lines: wrapped.extend(textwrap.wrap(line,width=84,replace_whitespace=True,drop_whitespace=True) or [''])
+    pages=[wrapped[i:i+45] for i in range(0,len(wrapped),45)] or [[]]
+    objects=[]
+    def obj(b): objects.append(b);return len(objects)
+    obj(b'<< /Type /Catalog /Pages 2 0 R >>');obj(b'');font=obj(b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')
+    page_ids=[]
+    for page in pages:
+        commands=[b'BT /F1 10 Tf 46 750 Td 15 TL']
+        for line in page:
+            text=line.encode('cp1252','replace').replace(b'\\',b'\\\\').replace(b'(',b'\\(').replace(b')',b'\\)')
+            commands.append(b'('+text+b') Tj T*')
+        commands.append(b'ET');content=b'\n'.join(commands);stream=obj(b'<< /Length '+str(len(content)).encode()+b' >>\nstream\n'+content+b'\nendstream')
+        page_ids.append(obj(b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 '+str(font).encode()+b' 0 R >> >> /Contents '+str(stream).encode()+b' 0 R >>'))
+    objects[1]=b'<< /Type /Pages /Count '+str(len(page_ids)).encode()+b' /Kids ['+b' '.join(str(i).encode()+b' 0 R' for i in page_ids)+b'] >>'
+    output=bytearray(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n'); offsets=[0]
+    for i,value in enumerate(objects,1):offsets.append(len(output));output.extend(f'{i} 0 obj\n'.encode()+value+b'\nendobj\n')
+    start=len(output);output.extend(f'xref\n0 {len(offsets)}\n0000000000 65535 f \n'.encode())
+    for x in offsets[1:]:output.extend(f'{x:010d} 00000 n \n'.encode())
+    output.extend(f'trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n'.encode());return bytes(output)
 
 class Handler(BaseHTTPRequestHandler):
     server_version='FlowCapture/0.1'
@@ -116,9 +152,14 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/templates':
                 rows=c.execute('SELECT * FROM templates WHERE shared=1 OR owner=? ORDER BY created DESC',(u['id'],)).fetchall();self.response(200,{'templates':[template_record(r) for r in rows]});return
             if path=='/api/tickets':
-                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall())) for r in rows]}); return
+                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r,u['role']), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall())) for r in rows]}); return
             if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role,active FROM users ORDER BY username')]}); return
             parts=path.strip('/').split('/')
+            if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='summary.pdf':
+                row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
+                if not row or (u['role']=='front' and row['owner']!=u['id']): self.response(404,{'error':'Not found.'});return
+                extra=c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=? ORDER BY field_name',(row['id'],)).fetchall()
+                self.response(200,summary_pdf(row,extra,u['role'] in ('admin','office')),'application/pdf',{'Content-Disposition':'attachment; filename="delivery-summary.pdf"'});return
             if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='file':
                 row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
                 if not row or (u['role']=='front' and row['owner']!=u['id']): self.response(404,{'error':'Not found.'}); return
@@ -181,8 +222,9 @@ class Handler(BaseHTTPRequestHandler):
                     b=self.json();target=str(b.get('recipient',''));subject=str(b.get('subject','')).strip();body=str(b.get('body','')).strip()
                     if not subject or len(subject)>120 or not body or len(body)>2000 or not c.execute("SELECT 1 FROM users WHERE id=? AND role='front' AND active=1",(target,)).fetchone():raise ValueError('Check the message and staff member.')
                     c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),target,u['id'],subject,body,'Sent',now()));c.commit();self.response(201,{'ok':True});return
-                if path=='/api/messages/acknowledge':
-                    b=self.json();result=c.execute("UPDATE messages SET status='Acknowledged' WHERE id=? AND recipient=?",(str(b.get('id','')),u['id'])).rowcount
+                if path in ('/api/messages/acknowledge','/api/messages/complete'):
+                    b=self.json();status='Completed' if path.endswith('/complete') else 'Acknowledged'
+                    result=c.execute("UPDATE messages SET status=? WHERE id=? AND recipient=? AND status<>'Completed'",(status,str(b.get('id','')),u['id'])).rowcount
                     if not result:self.response(404,{'error':'Message not found.'});return
                     c.commit();self.response(200,{'ok':True});return
                 if path=='/api/invitations':
