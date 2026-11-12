@@ -1,5 +1,6 @@
 import http.client, json, os, tempfile, threading, unittest
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 from http.server import ThreadingHTTPServer
 import app
 
@@ -27,6 +28,11 @@ class Workflow(unittest.TestCase):
         for name,role in [('driver','front'),('office','office')]:
             status,_,_=self.req('POST','/api/users',{'username':name,'password':'testing-password-456','role':role},admin,acsrf);self.assertEqual(status,201)
         driver,dcsrf=self.login('driver','testing-password-456');office,ocsrf=self.login('office','testing-password-456')
+        status,_,_=self.req('GET','/api/company-settings',token=driver);self.assertEqual(status,403)
+        status,_,_=self.req('POST','/api/company-settings',{'office_email':'office@example.com'},office,ocsrf);self.assertEqual(status,403)
+        status,_,_=self.req('POST','/api/company-settings',{'office_email':'bad'},admin,acsrf);self.assertEqual(status,400)
+        status,_,_=self.req('POST','/api/company-settings',{'office_email':'office@example.com'},admin,acsrf);self.assertEqual(status,200)
+        status,_,data=self.req('GET','/api/company-settings',token=admin);settings=json.loads(data);self.assertEqual(settings['office_email'],'office@example.com');self.assertFalse(settings['quickbooks_connected']);self.assertFalse(settings['email_configured'])
         template={'version':1,'name':'Hauling','industry':'Hauling','doc_type':'Ticket','shared':True,'fields':[{'key':'job_code','label':'Job code','type':'text','required':True}]}
         status,_,_=self.req('POST','/api/templates',template,driver,dcsrf);self.assertEqual(status,403)
         status,_,data=self.req('POST','/api/templates',template,admin,acsrf);self.assertEqual(status,201);template_id=json.loads(data)['id']
@@ -54,6 +60,13 @@ class Workflow(unittest.TestCase):
         for k,v in parts.items():body+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
         body+=f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="ticket.pdf"\r\nContent-Type: application/pdf\r\n\r\n'.encode()+b'%PDF-1.4\nexample\r\n'+f'--{boundary}--\r\n'.encode();ct='multipart/form-data; boundary='+boundary
         status,_,data=self.req('POST','/api/tickets',body,driver,dcsrf,ct);self.assertEqual(status,201);tid=json.loads(data)['id']
+        with patch.dict(os.environ,{'FLOWCAPTURE_GMAIL_ADDRESS':'sender@example.com','FLOWCAPTURE_GMAIL_APP_PASSWORD':'example app password'}), patch('app.smtplib.SMTP_SSL') as smtp:
+            smtp.return_value.__enter__.return_value.send_message.return_value={}
+            with app.db() as c:self.assertEqual(app.deliver_office_email(c,tid,b'%PDF-1.4\nexample','application/pdf','ticket.pdf'),'Sent')
+            mail=smtp.return_value.__enter__.return_value.send_message.call_args.args[0]
+            self.assertEqual(mail['To'],'office@example.com');self.assertEqual(len(list(mail.iter_attachments())),2)
+        with patch.dict(os.environ,{'FLOWCAPTURE_GMAIL_ADDRESS':'sender@example.com','FLOWCAPTURE_GMAIL_APP_PASSWORD':'example app password'}), patch('app.smtplib.SMTP_SSL',side_effect=OSError('offline')):
+            with app.db() as c:self.assertEqual(app.deliver_office_email(c,tid,b'%PDF-1.4\nexample','application/pdf','ticket.pdf'),'Failed')
         status,_,_=self.req('POST','/api/tickets',body,driver,dcsrf,ct);self.assertEqual(status,409)
         status,_,data=self.req('GET','/api/tickets',token=office);self.assertEqual(json.loads(data)['tickets'][0]['id'],tid);self.assertEqual(json.loads(data)['tickets'][0]['extra_fields']['Job code'],'ABC-5')
         status,_,data=self.req('GET','/api/tickets',token=office);ticket=json.loads(data)['tickets'][0];ticket['customer']='Preferred Asphalt corrected'
@@ -69,6 +82,19 @@ class Workflow(unittest.TestCase):
         status,_,raw=self.req('GET',f'/api/tickets/{tid}/summary.pdf',token=driver);self.assertEqual(status,200);self.assertTrue(raw.startswith(b'%PDF-'));self.assertNotIn(b'Rate per ton',raw)
         status,_,raw=self.req('GET',f'/api/tickets/{tid}/summary.pdf',token=office);self.assertEqual(status,200);self.assertIn(b'303.25',raw)
         status,_,_=self.req('POST',f'/api/tickets/{tid}/review',{'quantity':'1e9999','rate':'12','updated':'x'},office,ocsrf);self.assertEqual(status,400)
+        status,_,data=self.req('GET','/api/tickets',token=office);current=json.loads(data)['tickets'][0]
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/edit',current,office,ocsrf);self.assertEqual(status,200)
+        status,_,data=self.req('GET','/api/tickets',token=office);current=json.loads(data)['tickets'][0]
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/reject',{'updated':current['updated'],'reason':'Please add the PO'},driver,dcsrf);self.assertEqual(status,403)
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/reject',{'updated':current['updated'],'reason':'Please add the PO'},office,ocsrf);self.assertEqual(status,200)
+        status,_,data=self.req('GET','/api/tickets',token=driver);rejected=json.loads(data)['tickets'][0];self.assertEqual(rejected['status'],'Rejected')
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/review',{'quantity':'1','rate':'12','updated':rejected['updated']},office,ocsrf);self.assertEqual(status,409)
+        status,_,data=self.req('GET','/api/messages',token=driver);self.assertTrue(any(m['subject'].startswith('Ticket rejected') for m in json.loads(data)['messages']))
+        status,_,data=self.req('GET','/api/ticket-events',token=driver);self.assertEqual(json.loads(data)['events'][0]['reason'],'Please add the PO')
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/resubmit',{'updated':rejected['updated'],'reason':'PO 42'},office,ocsrf);self.assertEqual(status,403)
+        status,_,_=self.req('POST',f'/api/tickets/{tid}/resubmit',{'updated':rejected['updated'],'reason':'PO 42'},driver,dcsrf);self.assertEqual(status,200)
+        status,_,data=self.req('GET','/api/ticket-events',token=driver);self.assertEqual(len(json.loads(data)['events']),1)
+        status,_,data=self.req('GET','/api/tickets',token=office);self.assertEqual(json.loads(data)['tickets'][0]['status'],'Needs Review')
         status,_,raw=self.req('GET',f'/api/tickets/{tid}/file',token=office);self.assertEqual(status,200);self.assertTrue(raw.startswith(b'%PDF-'))
         status,_,_=self.req('POST','/api/users',{'username':'intruder','password':'testing-password-456','role':'admin'},office,ocsrf);self.assertEqual(status,403)
         status,_,_=self.req('POST','/api/users',{'username':'intruder','password':'testing-password-456','role':'admin'},admin,'bad');self.assertEqual(status,403)
