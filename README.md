@@ -18,7 +18,7 @@ Try the separate [interactive phone mockup](https://flowcapture-test-drive.media
 - Admins can configure an office email address and use Gmail SMTP with an app password supplied in hosting secrets. A new submission can email its original attachment and a PDF summary; email status is separate from the office inbox. QuickBooks Online connection is not implemented yet.
 - Office users send in-app messages to staff, who can acknowledge and mark them completed. Messages appear when the app is open or refreshed; the home screen checks for updates about every 30 seconds while visible. No push alerts are sent yet.
 
-**This is an early pilot, not production-ready.** It does not yet include AI/OCR, QuickBooks, forgotten-password recovery, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. Gmail delivery is optional; push notifications are not implemented. A ticket is delivered when the server confirms its receipt; the visible home screen checks for new records about every 30 seconds; users can also reopen the inbox. Accounting transactions are not created.
+**This is an early pilot, not production-ready.** It does not yet include QuickBooks, forgotten-password recovery, push notifications, offline upload queues, audit logs, account lockout/rate limiting, encrypted file storage, or automated backups. Gmail delivery is optional; push notifications are not implemented. A ticket is delivered when the server confirms its receipt; the visible home screen checks for new records about every 30 seconds; users can also reopen the inbox. Accounting transactions are not created.
 
 ## How to use the pilot
 
@@ -41,6 +41,10 @@ Python 3.12 or newer is required. No Python packages are needed.
 3. Open `http://127.0.0.1:8000` and sign in. Use **Team access** to create office and staff accounts.
 
 The initial Admin environment settings are used only when the database is empty. Data is saved in `data/` by default; set `FLOWCAPTURE_DATA` to choose another persistent directory. Stop the server before backing up, and include **both** the SQLite database and the `files/` folder. Test restores before relying on backups.
+
+## Optional AI extraction
+
+AI extraction is disabled by default. A customer who chooses to enable it sets `OPENAI_API_KEY` and `FLOWCAPTURE_AI_MODEL` in the host's secret settings, restarts the service, and enables AI under **Accounting & email setup**. Select a photo or PDF and choose **Extract details with AI**. The document is sent to OpenAI and may incur charges; suggested values fill only empty fields and must be checked before submitting. Manual entry remains available. No real provider account has been tested in this pilot; PDF/image extraction, model availability, provider billing, and data-handling requirements should be verified by the customer before use.
 
 ## Optional Gmail delivery
 
