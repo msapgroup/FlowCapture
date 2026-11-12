@@ -1,5 +1,6 @@
 """FlowCapture early pilot: single-company, authenticated ticket intake."""
-import base64, datetime, hashlib, hmac, json, mimetypes, os, secrets, sqlite3, threading, uuid
+import base64, datetime, hashlib, hmac, json, mimetypes, os, secrets, smtplib, sqlite3, ssl, threading, uuid
+from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default
 from http import cookies
@@ -33,6 +34,9 @@ def init():
         CREATE TABLE IF NOT EXISTS templates(id TEXT PRIMARY KEY, name TEXT NOT NULL, industry TEXT NOT NULL, doc_type TEXT NOT NULL, fields TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), shared INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS ticket_values(ticket_id TEXT NOT NULL REFERENCES tickets(id), field_name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ticket_id,field_name));
         CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, recipient TEXT NOT NULL REFERENCES users(id), sender TEXT NOT NULL REFERENCES users(id), subject TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS company_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS email_delivery(ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), status TEXT NOT NULL, updated TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS ticket_events(id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), actor TEXT NOT NULL REFERENCES users(id), event TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', snapshot TEXT NOT NULL, created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS invitations(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), csrf TEXT NOT NULL, expires TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, number TEXT NOT NULL, vendor TEXT NOT NULL, date TEXT NOT NULL, customer TEXT NOT NULL, job TEXT NOT NULL, truck TEXT NOT NULL, carrier TEXT NOT NULL, material TEXT NOT NULL, gross TEXT NOT NULL, tare TEXT NOT NULL, net TEXT NOT NULL, quantity TEXT NOT NULL, notes TEXT NOT NULL, rate TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, filename TEXT NOT NULL, filetype TEXT NOT NULL, storage TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), created TEXT NOT NULL, updated TEXT NOT NULL, UNIQUE(number,vendor,date));''')
@@ -108,6 +112,31 @@ def summary_pdf(row, extras, include_pricing):
     for x in offsets[1:]:output.extend(f'{x:010d} 00000 n \n'.encode())
     output.extend(f'trailer\n<< /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n'.encode());return bytes(output)
 
+def deliver_office_email(c, ticket_id, raw, typ, filename):
+    sender=os.environ.get('FLOWCAPTURE_GMAIL_ADDRESS','').strip()
+    password=os.environ.get('FLOWCAPTURE_GMAIL_APP_PASSWORD','').replace(' ','')
+    row=c.execute('SELECT * FROM tickets WHERE id=?',(ticket_id,)).fetchone()
+    dest=c.execute("SELECT value FROM company_settings WHERE key='office_email'").fetchone()
+    if not sender or not password or not dest or not dest['value']:
+        status='Not configured'
+    else:
+        status='Failed'
+        try:
+            mail=EmailMessage();mail['From']=sender;mail['To']=dest['value'];mail['Subject']='FlowCapture submission: '+row['number']
+            mail.set_content('A document was received in the company workspace. Review the submission in FlowCapture before creating an invoice.\nTicket: '+row['number'])
+            ext={'application/pdf':'pdf','image/jpeg':'jpg','image/png':'png'}[typ]
+            mail.add_attachment(raw,maintype=typ.split('/')[0],subtype=typ.split('/')[1],filename='original.'+ext)
+            extras=c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=? ORDER BY field_name',(ticket_id,)).fetchall()
+            mail.add_attachment(summary_pdf(row,extras,False),maintype='application',subtype='pdf',filename='flowcapture-summary.pdf')
+            with smtplib.SMTP_SSL('smtp.gmail.com',465,timeout=15,context=ssl.create_default_context()) as smtp:
+                smtp.login(sender,password);refused=smtp.send_message(mail)
+                if refused:raise smtplib.SMTPRecipientsRefused(refused)
+            status='Sent'
+        except (OSError,smtplib.SMTPException,ValueError):
+            status='Failed'
+    c.execute('INSERT INTO email_delivery VALUES(?,?,?) ON CONFLICT(ticket_id) DO UPDATE SET status=excluded.status,updated=excluded.updated',(ticket_id,status,now()));c.commit()
+    return status
+
 class Handler(BaseHTTPRequestHandler):
     server_version='FlowCapture/0.1'
     def log_message(self, fmt, *args): pass
@@ -149,10 +178,20 @@ class Handler(BaseHTTPRequestHandler):
                 rows=c.execute('SELECT messages.*,users.username AS staff FROM messages JOIN users ON users.id=messages.recipient '+('WHERE recipient=? ' if u['role']=='front' else '')+'ORDER BY created DESC',(u['id'],) if u['role']=='front' else ()).fetchall();self.response(200,{'messages':[dict(r) for r in rows]});return
             if path=='/api/staff' and u['role'] in ('admin','office'):
                 self.response(200,{'users':[dict(r) for r in c.execute("SELECT id,username FROM users WHERE role='front' AND active=1 ORDER BY username")]});return
+            if path=='/api/company-settings':
+                if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
+                values=dict(c.execute('SELECT key,value FROM company_settings').fetchall())
+                self.response(200,{'office_email':values.get('office_email',''),'email_configured':bool(os.environ.get('FLOWCAPTURE_GMAIL_ADDRESS') and os.environ.get('FLOWCAPTURE_GMAIL_APP_PASSWORD') and values.get('office_email')),'quickbooks_connected':False});return
             if path=='/api/templates':
                 rows=c.execute('SELECT * FROM templates WHERE shared=1 OR owner=? ORDER BY created DESC',(u['id'],)).fetchall();self.response(200,{'templates':[template_record(r) for r in rows]});return
+            if path=='/api/ticket-events':
+                query="SELECT e.id,e.ticket_id,e.event,e.reason,e.created,t.owner,t.number FROM ticket_events e JOIN tickets t ON t.id=e.ticket_id WHERE e.event='Rejected'"
+                args=()
+                if u['role']=='front': query+=' AND t.owner=?';args=(u['id'],)
+                query+=' ORDER BY e.created DESC'
+                self.response(200,{'events':[dict(r) for r in c.execute(query,args)]});return
             if path=='/api/tickets':
-                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r,u['role']), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall())) for r in rows]}); return
+                rows=c.execute('SELECT * FROM tickets '+('WHERE owner=? ' if u['role']=='front' else '')+'ORDER BY created DESC', (u['id'],) if u['role']=='front' else ()).fetchall(); self.response(200,{'tickets':[dict(record(r,u['role']), extra_fields=dict(c.execute('SELECT field_name,value FROM ticket_values WHERE ticket_id=?',(r['id'],)).fetchall()),email_status=(c.execute('SELECT status FROM email_delivery WHERE ticket_id=?',(r['id'],)).fetchone() or ['Not configured'])[0]) for r in rows]}); return
             if path=='/api/users' and u['role']=='admin': self.response(200,{'users':[dict(r) for r in c.execute('SELECT id,username,role,active FROM users ORDER BY username')]}); return
             parts=path.strip('/').split('/')
             if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='summary.pdf':
@@ -236,16 +275,40 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/devices/revoke':
                     if u['role']!='admin': self.response(403,{'error':'Admin access required.'});return
                     b=self.json();target=str(b.get('user_id',''));c.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE id=? AND role='front')",(target,));c.execute('UPDATE invitations SET used=1 WHERE user_id=?',(target,));c.commit();self.response(200,{'ok':True});return
+                if path=='/api/company-settings':
+                    if u['role']!='admin':self.response(403,{'error':'Admin access required.'});return
+                    import re
+                    b=self.json();email=b.get('office_email','')
+                    if not isinstance(email,str) or len(email)>254 or (email and not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email)):raise ValueError('Enter a valid email address.')
+                    c.execute("INSERT INTO company_settings(key,value) VALUES('office_email',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(email.strip(),));c.commit();self.response(200,{'ok':True});return
                 if path=='/api/templates':
                     b=self.json();payload=validate_template(b);shared=b.get('shared') is True
                     if shared and u['role']!='admin': self.response(403,{'error':'Only an Admin can share a template.'}); return
                     tid=str(uuid.uuid4());c.execute('INSERT INTO templates VALUES(?,?,?,?,?,?,?,?)',(tid,payload['name'],payload['industry'],payload['doc_type'],json.dumps(payload['fields']),u['id'],int(shared),now()));c.commit();self.response(201,{'id':tid});return
                 if path=='/api/tickets': self.upload(c,u); return
                 parts=path.strip('/').split('/')
+                if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3] in ('reject','resubmit'):
+                    b=self.json(); row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
+                    if not row:self.response(404,{'error':'Not found.'});return
+                    is_reject=parts[3]=='reject'
+                    if is_reject and u['role'] not in ('admin','office'):self.response(403,{'error':'Office or Admin access required.'});return
+                    if not is_reject and (u['role']!='front' or row['owner']!=u['id']):self.response(403,{'error':'Only the submitting staff member can resend this ticket.'});return
+                    if (is_reject and row['status']!='Needs Review') or (not is_reject and row['status']!='Rejected'):self.response(409,{'error':'This ticket is not in the required status.'});return
+                    reason=b.get('reason','')
+                    if not isinstance(reason,str) or not reason.strip() or len(reason)>2000:raise ValueError('Enter a reason or correction.')
+                    if str(b.get('updated',''))!=row['updated']:self.response(409,{'error':'This ticket changed. Reload it first.'});return
+                    stamp=now();newstatus='Rejected' if is_reject else 'Needs Review'
+                    changed=c.execute('UPDATE tickets SET status=?,updated=? WHERE id=? AND updated=? AND status=?',(newstatus,stamp,row['id'],row['updated'],row['status'])).rowcount
+                    if not changed:self.response(409,{'error':'This ticket changed. Reload it first.'});return
+                    c.execute('INSERT INTO ticket_events VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),row['id'],u['id'],newstatus,reason.strip(),json.dumps(record(row,'office')),stamp))
+                    if is_reject:c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),row['owner'],u['id'],'Ticket rejected: '+row['number'][:90],reason.strip(),'Sent',stamp))
+                    else:c.execute('UPDATE tickets SET notes=? WHERE id=?',((row['notes']+'\nStaff correction: '+reason.strip()).strip(),row['id']))
+                    c.commit();self.response(200,{'ok':True,'status':newstatus});return
                 if len(parts)==4 and parts[:2]==['api','tickets'] and parts[3]=='edit':
                     if u['role'] not in ('admin','office'): self.response(403,{'error':'Office or Admin access required.'});return
                     b=self.json();row=c.execute('SELECT * FROM tickets WHERE id=?',(parts[2],)).fetchone()
                     if not row: self.response(404,{'error':'Not found.'});return
+                    if row['status']=='Rejected':self.response(409,{'error':'The staff member must resend this rejected ticket first.'});return
                     keys=['number','vendor','date','customer','job','truck','carrier','material','gross','tare','net','quantity','notes']
                     values={}
                     for k in keys:
@@ -267,9 +330,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not row: self.response(404,{'error':'Not found.'}); return
                     rate=safe_amount(b.get('rate','')); qty=safe_amount(b.get('quantity',row['quantity']))
                     if rate is None or qty is None: raise ValueError('Enter a valid non-negative quantity and rate.')
+                    if row['status']!='Needs Review':self.response(409,{'error':'Only tickets needing review can be approved.'});return
                     changed=c.execute('UPDATE tickets SET rate=?,quantity=?,status=?,updated=? WHERE id=? AND updated=?',(str(rate),str(qty),'Ready',now(),row['id'],str(b.get('updated','')))).rowcount
                     if not changed:self.response(409,{'error':'This ticket changed. Reload it before approval.'});return
-                    c.commit(); self.response(200,{'ok':True}); return
+                    c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(str(uuid.uuid4()),row['owner'],u['id'],'Ticket approved: '+row['number'][:90],'Approved for QuickBooks review. No invoice has been sent.', 'Sent',now()));c.commit(); self.response(200,{'ok':True}); return
                 self.response(404,{'error':'Not found.'})
         except sqlite3.IntegrityError: self.response(409,{'error':'That ticket (number, vendor, and date) or username already exists.'})
         except (ValueError,KeyError,json.JSONDecodeError): self.response(400,{'error':'Check the form and try again.'})
@@ -311,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('INSERT INTO tickets(id,number,vendor,date,customer,job,truck,carrier,material,gross,tare,net,quantity,notes,status,filename,filetype,storage,owner,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (tid,*[fields.get(k,'') for k in keys],'Needs Review',filename,typ,tid,u['id'],stamp,stamp)); c.executemany('INSERT INTO ticket_values VALUES(?,?,?)',[(tid,k,v) for k,v in extra.items()]); c.commit()
             except Exception:
                 out.unlink(missing_ok=True); raise
-        self.response(201,{'id':tid,'status':'Needs Review'})
+        email_status=deliver_office_email(c,tid,raw,typ,filename)
+        self.response(201,{'id':tid,'status':'Needs Review','email_status':email_status})
 
 def serve():
     init(); addr=os.environ.get('FLOWCAPTURE_HOST','127.0.0.1'); port=int(os.environ.get('PORT','8000'))
