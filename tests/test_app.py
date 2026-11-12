@@ -1,4 +1,4 @@
-import http.client, json, os, tempfile, threading, unittest
+import hashlib, http.client, json, os, tempfile, threading, unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from urllib.parse import urlparse, parse_qs
@@ -44,6 +44,10 @@ class Workflow(unittest.TestCase):
         status,_,_=self.req('POST','/api/login',{'username':'newhire','password':'newhire-password-123'});self.assertEqual(status,401)
         self.login('newhire','replacement-password-987')
         status,_,_=self.req('POST','/api/invitation/accept',{'token':reset,'password':'another-password-123'});self.assertEqual(status,400)
+        status,_,data=self.req('POST','/api/invitations',{'user_id':newid},admin,acsrf);expired=json.loads(data)['token']
+        with app.db() as c:c.execute('UPDATE invitations SET expires=? WHERE token_hash=?',('2000-01-01T00:00:00+00:00',hashlib.sha256(expired.encode()).hexdigest()));c.commit()
+        status,_,_=self.req('POST','/api/invitation/accept',{'token':expired,'password':'another-password-123'});self.assertEqual(status,400)
+
 
 
         status,_,_=self.req('GET','/api/company-settings',token=driver);self.assertEqual(status,403)
