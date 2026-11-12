@@ -59,6 +59,14 @@ class Workflow(unittest.TestCase):
         parts={'template_id':template_id,'custom_job_code':'ABC-5','number':'3631110','vendor':'Conrad','date':'2026-10-05','customer':'Preferred','quantity':'24.26'}; boundary='flowcapture-boundary';body=b''
         for k,v in parts.items():body+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
         body+=f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="ticket.pdf"\r\nContent-Type: application/pdf\r\n\r\n'.encode()+b'%PDF-1.4\nexample\r\n'+f'--{boundary}--\r\n'.encode();ct='multipart/form-data; boundary='+boundary
+        status,_,_=self.req('POST','/api/ai-extract',body,driver,dcsrf,ct);self.assertEqual(status,403)
+        with patch.dict(os.environ,{'OPENAI_API_KEY':'test-not-a-real-key','FLOWCAPTURE_AI_MODEL':'test-model'}), patch('app.urlopen') as client:
+            response={'status':'completed','output':[{'type':'message','content':[{'type':'output_text','text':json.dumps({k:('3631110' if k=='number' else '') for k in app.AI_FIELDS})}]}]}
+            client.return_value.__enter__.return_value=MagicMock(read=MagicMock(return_value=json.dumps(response).encode()))
+            status,_,_=self.req('POST','/api/company-settings',{'office_email':'office@example.com','ai_enabled':True},admin,acsrf);self.assertEqual(status,200)
+            status,_,data=self.req('POST','/api/ai-extract',body,driver,dcsrf,ct);self.assertEqual(status,200);self.assertEqual(json.loads(data)['fields']['number'],'3631110');self.assertTrue(json.loads(data)['review_required'])
+            request=client.call_args.args[0];payload=json.loads(request.data);self.assertFalse(payload['store']);self.assertEqual(payload['input'][0]['content'][1]['type'],'input_file')
+        status,_,_=self.req('POST','/api/company-settings',{'office_email':'office@example.com','ai_enabled':False},admin,acsrf);self.assertEqual(status,200)
         status,_,data=self.req('POST','/api/tickets',body,driver,dcsrf,ct);self.assertEqual(status,201);tid=json.loads(data)['id']
         with patch.dict(os.environ,{'FLOWCAPTURE_GMAIL_ADDRESS':'sender@example.com','FLOWCAPTURE_GMAIL_APP_PASSWORD':'example app password'}), patch('app.smtplib.SMTP_SSL') as smtp:
             smtp.return_value.__enter__.return_value.send_message.return_value={}
