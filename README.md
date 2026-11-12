@@ -2,6 +2,8 @@
 
 FlowCapture is an early, customer-hosted pilot for capturing load tickets and delivering them to an office inbox. It is a mobile-friendly website for iPhone, iPad, Android, and desktop browsers.
 
+Try the separate [interactive phone mockup](https://flowcapture-test-drive.mediaplusmsap.chatgpt.site). It uses sample data and simulated actions.
+
 ## Current pilot
 
 - Sign in as Front Line Staff, Office Manager, or Admin.
